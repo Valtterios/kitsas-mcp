@@ -1,6 +1,6 @@
 import pytest
 
-from kitsas_mcp.errors import AccountNotFoundError, DateFormatError
+from kitsas_mcp.errors import AccountNotFoundError, DateFormatError, NotABankAccountError
 from kitsas_mcp.reconcile import bank_balance, bank_movements
 
 
@@ -89,6 +89,25 @@ def test_balance_accepts_an_explicit_valid_account(book):
     # A correct explicit account must still work; validation is not
     # over-strict about the case that matches the book.
     assert bank_balance(book, "2026-12-31", account=1910)["balance"] == "-94.62"
+
+
+def test_balance_refuses_an_expense_account(book):
+    # 4590 "Edustuskulut" exists and has movements, so it produces a
+    # plausible-looking number that is not a bank balance. bank_balance's
+    # whole point is checking against a real bank statement, so this must
+    # be refused rather than answered.
+    with pytest.raises(NotABankAccountError) as excinfo:
+        bank_balance(book, "2026-12-31", account=4590)
+    message = str(excinfo.value)
+    assert "4590" in message
+    assert "DZ" in message  # what type it actually is
+    assert "bank account" in message  # the fix: pass a real one, or omit it
+
+
+def test_movements_refuses_an_expense_account(book):
+    with pytest.raises(NotABankAccountError) as excinfo:
+        bank_movements(book, "2026-01-01", "2026-12-31", account=4590)
+    assert "4590" in str(excinfo.value)
 
 
 def test_movements_accepts_the_minimum_possible_date_from(book):

@@ -41,6 +41,10 @@ class AccountNotFoundError(KitsasError):
     pass
 
 
+class NotABankAccountError(KitsasError):
+    pass
+
+
 class LineFormatError(KitsasError):
     pass
 
@@ -55,6 +59,10 @@ class AmountError(KitsasError):
 
 class AmbiguousSupplierError(KitsasError):
     pass
+
+
+class PartnerNotFoundError(KitsasError):
+    """An explicit partner_id that names no partner, or is not an id at all."""
 
 
 class DateFormatError(KitsasError):

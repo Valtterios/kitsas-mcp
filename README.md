@@ -27,6 +27,14 @@ bookkeeping. `delete_draft` is the only other tool that writes, and it can
 only discard a voucher that has not reached the ledger. Every other tool
 only reads.
 
+## A book on a network share
+
+A book kept on a NAS or a Windows share works, addressed either by its UNC
+path (`\\server\share\kirjanpito.kitsas`) or through a mapped drive letter.
+The same rule applies as for a local book: Kitsas itself must have it closed,
+and so must every other Kitsas on the network, because the exclusive lock is
+on the file.
+
 ## Install
 
 From a clone:
@@ -72,12 +80,12 @@ claude mcp add kitsas -e KITSAS_BOOK=/path/to/kirjanpito.kitsas -- uv run --dire
 ## Tools
 
 - `list_accounts` - list the book's chart of accounts, optionally filtered by a substring of the name or the first digits of the number.
-- `list_fiscal_years` - list fiscal years, showing which is current and which are confirmed and closed to writes.
+- `list_fiscal_years` - list fiscal years, showing which is current and which are confirmed and closed to writes. `confirmed` is the confirmation date or null; `confirmed_unknown` is true for a year whose stored data cannot be read, which is closed to writes too.
 - `find_supplier` - find a partner by name, business id or IBAN.
 - `list_vouchers` - list vouchers in a date range, ledger vouchers by default.
 - `get_voucher` - get one voucher with all its entries and attachment names.
 - `suggest_account` - which expense accounts a supplier's earlier bills were booked to, most used first; call this before `add_purchase_invoice`.
-- `add_purchase_invoice` - create a purchase invoice as an unapproved draft; never enters the ledger on its own.
+- `add_purchase_invoice` - create a purchase invoice as an unapproved draft; never enters the ledger on its own. `partner_id` names the partner outright when the supplier name would find the wrong one.
 - `delete_draft` - delete a voucher that is not yet in the ledger, including a draft Kitsas itself created; refuses anything already in the ledger.
 - `bank_balance` - the book's balance on the bank account as of a date, for checking against a statement.
 - `bank_movements` - every ledger entry on the bank account in a date range, with a running balance.
@@ -91,9 +99,13 @@ These are the invariants the code enforces, not just intentions:
 - Nothing can be written into a confirmed fiscal year. `add_purchase_invoice` looks up the fiscal year for the booking date and refuses if it has been confirmed, naming the confirmation date.
 - A backup of the book is taken before every write transaction, alongside its `-wal`/`-shm` sidecars if present. A write is refused, and the book left untouched, if the backup cannot be made.
 - Anything already in the ledger is read-only through this server. `delete_draft` refuses a voucher whose state has reached the ledger threshold, both before and again inside the write transaction, and no update statement it issues can touch such a voucher even on its own.
+- A supplier name is resolved to a partner the same way everywhere: `find_supplier`, `suggest_account` and `add_purchase_invoice` share one rule, so the account history you are shown belongs to the partner the voucher is then attached to. A name that identifies a partner already in the book joins that partner instead of forking a duplicate beside it, and a match on a name that is not the partner's own is named in the summary. A name matching several partners is refused, listing them: which supplier a bill belongs to is the bookkeeper's call. Only a name that matches no partner creates one. Names are compared case-folded with Python's `str.casefold`, not with SQLite's `lower()` and `LIKE`, which fold ASCII only: in a Finnish book `Kärkkäinen Oy` and `KÄRKKÄINEN OY` have to be one partner, and under `lower()` they were two.
+- Only the voucher is written when the supplier name matched a partner by a substring of its name rather than by the name itself. That partner keeps its own business id and its own IBAN, and the summary says both were skipped. The voucher is a draft `delete_draft` can reverse; an edit to a partner that already existed is not, and a substring match is a guess: a sole trader "Nieminen" matches the member "Kari Nieminen", and it would be that member's record taking the supplier's bank account.
+- `partner_id` is the way out when the name rule cannot reach the right partner, which is exactly the case above: a supplier whose real name is contained in another partner's name matches that partner however fully it is spelled. Given `partner_id`, `add_purchase_invoice` uses that partner with no name matching at all and refuses if no such partner exists; `supplier_name` is then only the text written on the voucher, and the summary says which partner the voucher went to when the two differ. `find_supplier` gives the ids.
 - An IBAN already bound to one partner is never silently re-pointed to another. `add_purchase_invoice` refuses instead of overwriting the binding, naming who the IBAN currently belongs to.
 - An attachment over 20 MB is refused before it is even read from disk, so an oversized file is never copied into the book or into every future backup of it.
-- A business id read off an invoice is written onto an existing partner only when that partner has no business id yet and no vouchers in the ledger. One already on file is left alone, and so is a blank one on a partner that already has bookkeeping history: the draft is still written, and the summary names the partner that was left as it was, so the correction can be made in Kitsas. A wrong value read from a scan would otherwise be undoable except by restoring a backup.
+- A business id read off an invoice is written onto an existing partner only when that partner has no business id yet, no vouchers in the ledger, and was identified exactly, by its own name or by `partner_id`. One already on file is left alone, and so is a blank one on a partner that already has bookkeeping history: the draft is still written, and the summary names the partner that was left as it was, so the correction can be made in Kitsas. A wrong value read from a scan would otherwise be undoable except by restoring a backup.
+- Every failure an MCP client sees is a message naming the cause and the fix, flagged as an error on the response rather than only inside the JSON payload. That includes failures the code did not anticipate: an unexpected exception inside a tool is reported as an internal error, not raised into the transport where it would be delivered without the error flag set.
 
 ### Backups accumulate
 

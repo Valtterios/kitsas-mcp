@@ -154,3 +154,24 @@ def test_a_partner_id_as_an_integer_still_works(book):
 def test_a_name_is_still_treated_as_a_name(book):
     assert suggest_account(book, "Hetzner")[0]["account"] == 4590
     assert suggest_account(book, "Telia") == []
+
+
+# -- LIKE metacharacters in the caller's query are literal text ---------------
+
+
+def test_a_wildcard_query_does_not_reach_every_partner(book, book_path):
+    """'%' matched every partner, so a name nobody typed was named back at them."""
+    conn = sqlite3.connect(book_path)
+    conn.execute("INSERT INTO Kumppani (id, nimi, json) VALUES (50, 'Alennus 50% Oy', '{}')")
+    conn.commit()
+    conn.close()
+
+    # Read literally, '%' is the name of exactly one partner, and that partner
+    # has no bookkeeping history.
+    assert suggest_account(book, "%") == []
+    assert suggest_account(book, "50%") == []
+
+
+def test_an_underscore_query_does_not_return_another_partners_history(book):
+    """'_e_zner' wildcard-matched 'Hetzner' and offered its account as the answer."""
+    assert suggest_account(book, "_e_zner") == []

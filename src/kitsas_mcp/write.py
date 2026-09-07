@@ -6,12 +6,22 @@ into the ledger and allocates its number when a human approves it. This server
 never does either, and never touches a voucher that is already in the ledger.
 
 Nothing outside the voucher being created is ever rewritten. A partner may be
-created, and a blank business id filled in on a partner that has no ledger
-history yet, but an existing IBAN binding is never re-pointed and neither a
-business id nor an IBAN on an established partner is ever overwritten. An IBAN
-that belongs elsewhere is refused; a business id on an established partner is
-left alone and reported in the summary, because the voucher does not depend on
-it and refusing would block the ordinary path.
+created, and a blank business id filled in and an IBAN bound on a partner the
+caller identified exactly, but an existing IBAN binding is never re-pointed and
+neither a business id nor an IBAN on an established partner is ever
+overwritten. A supplier name that already identifies a partner joins that
+partner rather than forking a second one beside it; the name is resolved by
+partners.py, the same rule suggest_account answers with, and a match on a name
+that is not the partner's own is named in the summary. An IBAN that belongs
+elsewhere is refused; a business id on an established partner is left alone and
+reported in the summary, because the voucher does not depend on it and refusing
+would block the ordinary path.
+
+When the partner was found only by a substring of its name, the voucher is
+still written but the business id and the IBAN are not. The voucher is a
+reversible draft; those two are edits to somebody else's row that delete_draft
+does not undo. partner_id names a partner outright, with no name matching at
+all, for the cases where the name rule cannot reach the right one.
 """
 
 import hashlib
@@ -19,27 +29,59 @@ import json
 import mimetypes
 from pathlib import Path
 
-from .accounts import default_bank_account, get_account
+from .accounts import account_by_number, default_bank_account_of, list_accounts
 from .constants import (
+    TILA_HYLATTY,
+    TILA_HYVAKSYTTY,
     TILA_KIRJANPIDOSSA,
+    TILA_LUONNOS,
+    TILA_MALLIPOHJA,
     TILA_POISTETTU,
     TILA_SAAPUNUT,
+    TILA_TARKASTETTU,
     TOSITE_MENO,
     VIENTI_OSTO_KIRJAUS,
     VIENTI_OSTO_VASTAKIRJAUS,
 )
 from .dates import parse_iso_date
 from .errors import (
-    AmbiguousSupplierError,
     AmountError,
     ClosedFiscalYearError,
     KitsasError,
     LedgerVoucherError,
     LineFormatError,
+    PartnerNotFoundError,
     UnbalancedVoucherError,
 )
 from .money import cents_to_euros, euros_to_cents
-from .read import fiscal_year_for
+from .partners import PartnerMatch, resolve_partner
+from .read import CONFIRMED_UNKNOWN_KEY, fiscal_year_for, no_such_voucher_error
+
+# The voucher states delete_draft is actually meant for: a document waiting
+# in the inbox, one that has been checked or accepted but not yet booked, and
+# a plain draft. Deliberately excludes TILA_MALLIPOHJA (a saved voucher
+# template) and TILA_HYLATTY (a rejected document): both sit below the
+# TILA_KIRJANPIDOSSA ledger threshold, so the old "anything below the
+# threshold" guard let delete_draft mark either one deleted, which for a
+# template is recoverable only from a .bak.
+DELETABLE_STATES = frozenset({TILA_SAAPUNUT, TILA_TARKASTETTU, TILA_HYVAKSYTTY, TILA_LUONNOS})
+
+# Plain-language names for the states below the ledger threshold that
+# delete_draft still refuses, so the error can name what the voucher actually
+# is rather than just its number.
+_NON_DELETABLE_STATE_NAMES = {
+    TILA_POISTETTU: "already deleted",
+    TILA_MALLIPOHJA: "a voucher template Kitsas keeps for reuse",
+    TILA_HYLATTY: "a rejected document",
+}
+
+# The ways out of an ambiguity here, in the order they are worth trying:
+# name the partner outright with partner_id, narrow the name, or merge the
+# partners in Kitsas if they are really one supplier.
+AMBIGUITY_REMEDY = (
+    "Pass partner_id to say which one you mean, use a name that matches exactly one "
+    "of them, or merge them in Kitsas; find_supplier lists them with their ids."
+)
 
 # An invoice scan is a few hundred kilobytes. Anything past this is a wrong
 # path, and it would be copied into every future backup of the book forever.
@@ -55,6 +97,17 @@ TOSITE_INSERT = (
 
 def _check_fiscal_year(book, booking_date: str) -> None:
     year = fiscal_year_for(book, booking_date)
+    if year[CONFIRMED_UNKNOWN_KEY]:
+        # Whether this year was confirmed cannot be read at all (Tilikausi.json
+        # is corrupt). Refusing is the safe direction: reporting it as
+        # unconfirmed instead would let a write through a year that might
+        # really be closed, and there would be no way to notice.
+        raise ClosedFiscalYearError(
+            f"The fiscal year {year['starts']} to {year['ends']} has unreadable data in "
+            "this book, so whether it has been confirmed cannot be determined. Nothing "
+            "may be added to it until that is known, in case it is really closed. Open "
+            "the book in Kitsas, which will rewrite the year's data, then try again."
+        )
     if year["confirmed"]:
         raise ClosedFiscalYearError(
             f"The fiscal year {year['starts']} to {year['ends']} was confirmed on "
@@ -63,8 +116,8 @@ def _check_fiscal_year(book, booking_date: str) -> None:
         )
 
 
-def _prepare_lines(book, lines, description, supplier_name) -> list[tuple]:
-    """Validate every line before any connection is opened for writing."""
+def _prepare_lines(accounts, lines, description, supplier_name) -> list[tuple]:
+    """Validate every line against a chart of accounts already loaded once."""
     if not lines:
         raise UnbalancedVoucherError(
             "A bill needs at least one expense line. Pass lines as, for example, "
@@ -87,7 +140,7 @@ def _prepare_lines(book, lines, description, supplier_name) -> list[tuple]:
                 "string like '42.90'."
             )
 
-        get_account(book, account)  # raises AccountNotFoundError
+        account_by_number(accounts, account)  # raises AccountNotFoundError
         cents = euros_to_cents(line["amount"])  # raises AmountError
         if cents <= 0:
             raise AmountError(
@@ -140,22 +193,92 @@ def _normalise_iban(iban) -> str:
     return str(iban).replace(" ", "").replace("\xa0", "").upper()
 
 
-def _find_supplier_id(conn, name: str) -> int | None:
-    """Resolve a partner by name, refusing to choose between real alternatives."""
-    rows = conn.execute(
-        "SELECT id, nimi FROM Kumppani WHERE lower(trim(nimi)) = lower(?) ORDER BY id",
-        (name,),
-    ).fetchall()
-    if not rows:
-        return None
-    if len(rows) > 1:
-        names = ", ".join(f"{r['nimi']!r} (id {r['id']})" for r in rows)
-        raise AmbiguousSupplierError(
-            f"{name!r} matches {len(rows)} partners in this book that differ only by "
-            f"case or spacing: {names}. Merge or rename them in Kitsas, or pass a name "
-            "that matches exactly one of them."
+def _matched_partner_note(typed: str, matched_name: str) -> str:
+    """Say out loud which partner a name that was not the partner's own landed on.
+
+    Reusing the partner is right: it is the one suggest_account just showed the
+    history of, and creating a second one beside it would split the supplier in
+    the book. But the voucher is being attached to a partner spelled
+    differently from what was typed, and on someone's books that is worth
+    reading rather than guessing at.
+
+    The remedy named here has to be one that can actually work. It used to be
+    "pass the full name", which is the very input that just failed: a supplier
+    whose real name is contained in an existing partner's name, a sole trader
+    "Nieminen" against the member "Kari Nieminen", matches that partner however
+    fully it is spelled. partner_id is the way out, because it does not go
+    through name matching at all.
+    """
+    return (
+        f"Booked to {matched_name}, the partner already in this book that {typed!r} "
+        "matched; no new partner was created. If that is the wrong partner, pass "
+        "partner_id for the right one (find_supplier lists the ids), or add the "
+        "supplier in Kitsas first."
+    )
+
+
+def _fuzzy_write_skipped_note(lead: str, typed: str) -> str:
+    """Say that a write onto an existing partner's own data was skipped, and why.
+
+    Same shape as the business-id skip note below: what was left alone, why,
+    and what to do if it really was meant. The voucher is a draft and can be
+    deleted; a business id or an IBAN written onto a partner cannot be undone
+    by delete_draft, only by restoring a backup. So when the partner was found
+    by a substring of its name rather than by the name itself, which is a
+    guess, those two writes do not happen at all.
+    """
+    return (
+        f"{lead}, because {typed!r} only matched inside that partner's name rather than "
+        "being the name itself. Pass partner_id if that really is the supplier, or make "
+        "the change in Kitsas."
+    )
+
+
+def _partner_id_number(value) -> int:
+    """The partner id as a number. JSON may deliver it as the string '7'."""
+    text = str(value).strip()
+    if isinstance(value, bool) or not (text.isascii() and text.isdigit()):
+        raise PartnerNotFoundError(
+            f"partner_id is {value!r}, which is not a partner id. Pass the number "
+            "find_supplier returns as 'id', or leave partner_id out to match the "
+            "supplier by name."
         )
-    return rows[0]["id"]
+    return int(text)
+
+
+def _partner_by_id(conn, partner_id) -> PartnerMatch:
+    """The partner this id names, with no name matching of any kind.
+
+    The escape hatch from the name rule. A partner named this way is exact by
+    construction: the caller pointed at one row, so nothing here is a guess,
+    and the business id and IBAN writes below go ahead as they do for a name
+    that was the partner's own.
+    """
+    number = _partner_id_number(partner_id)
+    row = conn.execute("SELECT id, nimi FROM Kumppani WHERE id = ?", (number,)).fetchone()
+    if row is None:
+        raise PartnerNotFoundError(
+            f"There is no partner {number} in this book. Use find_supplier to get the "
+            "id of the supplier you meant, or leave partner_id out to match by name."
+        )
+    return PartnerMatch(row["id"], row["nimi"], True)
+
+
+def _named_partner_note(typed: str, matched: str) -> str | None:
+    """Note the mismatch when partner_id and supplier_name disagree, or None.
+
+    partner_id decides which partner the voucher belongs to; supplier_name is
+    then only the text on the voucher. That is the point of the argument, so
+    the mismatch is reported rather than refused: the name printed on an
+    invoice often is not the name the partner is filed under, and that is
+    exactly when a bookkeeper reaches for the id.
+    """
+    if typed.strip().casefold() == str(matched).strip().casefold():
+        return None
+    return (
+        f"Booked to {matched}, the partner partner_id names. The supplier name "
+        f"{typed!r} was not looked up at all; it is the voucher's text only."
+    )
 
 
 def _bind_iban(conn, supplier_id: int, supplier_name: str, iban) -> None:
@@ -221,27 +344,73 @@ def _fill_blank_business_id(conn, supplier_id: int, name: str, business_id) -> s
     return None
 
 
-def _upsert_supplier(conn, name: str, business_id, iban) -> tuple[int, str | None]:
-    """Return the partner id, and a note for the summary if anything was skipped."""
-    note = None
-    supplier_id = _find_supplier_id(conn, name)
-    if supplier_id is None:
+def _upsert_supplier(
+    conn, name: str, business_id, iban, partner_id=None
+) -> tuple[int, str, list[str]]:
+    """Return the partner id, the name it is filed under, and notes for the summary.
+
+    With partner_id the partner is that row and nothing is resolved. Without
+    it the name is resolved by the rule in partners.py, the same one
+    suggest_account answered with a moment earlier, so a bill for a supplier
+    that is already in the book joins that partner instead of forking a second
+    one that carries none of its history. A name that matches nothing really is
+    a new supplier, and that partner is created here.
+
+    Only the voucher is written when the partner was found by a substring of
+    its name. The business id and the IBAN are edits to a partner that already
+    existed, they survive delete_draft, and a substring match is a guess: a
+    sole trader "Nieminen" matches the member "Kari Nieminen", and it is that
+    member's record that would otherwise take the supplier's IBAN and business
+    id. Both are skipped and named in the summary instead.
+    """
+    notes = []
+    if partner_id is not None:
+        match = _partner_by_id(conn, partner_id)
+        named = _named_partner_note(name, match.name)
+        if named:
+            notes.append(named)
+    else:
+        match = resolve_partner(conn, name, remedy=AMBIGUITY_REMEDY)
+
+    if match is None:
         cursor = conn.execute(
             "INSERT INTO Kumppani (nimi, alvtunnus, json) VALUES (?,?,?)",
             (name, business_id, "{}"),
         )
-        supplier_id = cursor.lastrowid
-    elif business_id:
-        existing = conn.execute(
-            "SELECT coalesce(alvtunnus,'') AS alvtunnus FROM Kumppani WHERE id = ?",
-            (supplier_id,),
-        ).fetchone()
-        if existing["alvtunnus"] == "":
-            note = _fill_blank_business_id(conn, supplier_id, name, business_id)
+        # A partner created here is filed under exactly the name that was
+        # typed, and has no data of its own for this call to overwrite.
+        supplier_id, filed_as, identified = cursor.lastrowid, name, True
+    else:
+        supplier_id, filed_as, identified = match.id, match.name, match.exact
+        if not identified:
+            notes.append(_matched_partner_note(name, filed_as))
+        if business_id:
+            if not identified:
+                notes.append(
+                    _fuzzy_write_skipped_note(
+                        f"Left the business id unchanged on {filed_as}", name
+                    )
+                )
+            else:
+                existing = conn.execute(
+                    "SELECT coalesce(alvtunnus,'') AS alvtunnus FROM Kumppani WHERE id = ?",
+                    (supplier_id,),
+                ).fetchone()
+                if existing["alvtunnus"] == "":
+                    skipped = _fill_blank_business_id(conn, supplier_id, filed_as, business_id)
+                    if skipped:
+                        notes.append(skipped)
 
     if iban:
-        _bind_iban(conn, supplier_id, name, iban)
-    return supplier_id, note
+        if identified:
+            _bind_iban(conn, supplier_id, filed_as, iban)
+        else:
+            notes.append(
+                _fuzzy_write_skipped_note(
+                    f"Did not bind the IBAN {_normalise_iban(iban)} to {filed_as}", name
+                )
+            )
+    return supplier_id, filed_as, notes
 
 
 def _attach(conn, voucher_id: int, attachment: tuple) -> dict:
@@ -294,6 +463,7 @@ def add_purchase_invoice(
     booking_date: str,
     business_id=None,
     iban=None,
+    partner_id=None,
     invoice_date=None,
     due_date=None,
     reference=None,
@@ -301,7 +471,18 @@ def add_purchase_invoice(
     credit_account=None,
     pdf_path=None,
 ) -> dict:
-    """Create a purchase invoice as a draft. Kitsas approves it into the ledger."""
+    """Create a purchase invoice as a draft. Kitsas approves it into the ledger.
+
+    partner_id, when given, names the partner outright: no name matching of
+    any kind happens, the partner must exist, and supplier_name is then only
+    the text that goes on the voucher.
+    """
+    # booking_date is validated here rather than only inside
+    # _check_fiscal_year, whose own parse was a side effect: the raw value
+    # went on to be bound into Tosite.pvm and both Vienti.pvm columns, where
+    # an unpadded "2026-2-28" compares wrong as text against every other
+    # date in the book. Assigned like invoice_date and due_date below.
+    booking_date = parse_iso_date(booking_date, "booking_date")
     _check_fiscal_year(book, booking_date)
 
     supplier_name = str(supplier_name).strip()
@@ -311,27 +492,39 @@ def add_purchase_invoice(
             "on the voucher, for example 'Telia Finland Oyj'."
         )
 
-    # Optional, but not free-form: booking_date is already validated via
-    # _check_fiscal_year above. invoice_date and due_date are stored as-is
-    # into laskupvm/erapvm with no fiscal-year check of their own, so without
-    # this they would be the only two date fields on this voucher a malformed
-    # value could reach unchecked.
+    # Optional, but not free-form: booking_date was validated and reassigned
+    # above. invoice_date and due_date are stored as-is into laskupvm/erapvm
+    # with no fiscal-year check of their own, so without this they would be
+    # the only two date fields on this voucher a malformed value could reach
+    # unchecked.
     if invoice_date is not None:
         invoice_date = parse_iso_date(invoice_date, "invoice_date")
     if due_date is not None:
         due_date = parse_iso_date(due_date, "due_date")
 
-    prepared = _prepare_lines(book, lines, description, supplier_name)
+    # Loaded once and validated against in memory: a five-line bill used to
+    # open a fresh connection per account lookup, plus one more for the
+    # default bank account, all before the write transaction even opened.
+    accounts = list_accounts(book)
+
+    prepared = _prepare_lines(accounts, lines, description, supplier_name)
     total = sum(cents for _, cents, _ in prepared)
 
-    counter_account = credit_account if credit_account is not None else default_bank_account(book)
-    get_account(book, counter_account)
+    if credit_account is None:
+        # Already validated by construction: default_bank_account_of only
+        # ever returns a number that is in `accounts`.
+        counter_account = default_bank_account_of(accounts)
+    else:
+        account_by_number(accounts, credit_account)  # raises AccountNotFoundError
+        counter_account = credit_account
 
     attachment_source = _read_attachment(pdf_path) if pdf_path else None
     title = description or supplier_name
 
     with book.connect_write() as conn:
-        supplier_id, business_id_note = _upsert_supplier(conn, supplier_name, business_id, iban)
+        supplier_id, filed_as, supplier_notes = _upsert_supplier(
+            conn, supplier_name, business_id, iban, partner_id
+        )
 
         cursor = conn.execute(
             TOSITE_INSERT,
@@ -383,6 +576,10 @@ def add_purchase_invoice(
                     {
                         "source": "kitsas-mcp",
                         "supplier": supplier_name,
+                        # Both names, because they differ when the typed one
+                        # matched a partner already in the book.
+                        "partner": filed_as,
+                        "partner_id": supplier_id,
                         "booking_date": booking_date,
                         "lines": [
                             {"account": a, "cents": c, "description": d} for a, c, d in prepared
@@ -395,6 +592,10 @@ def add_purchase_invoice(
 
     return {
         "voucher_id": voucher_id,
+        # The partner the voucher is actually attached to, which is not always
+        # spelled the way the supplier name was typed.
+        "supplier": filed_as,
+        "supplier_id": supplier_id,
         "total": cents_to_euros(total),
         "credit_account": counter_account,
         "lines": [{"account": a, "amount": cents_to_euros(c)} for a, c, _ in prepared],
@@ -404,23 +605,33 @@ def add_purchase_invoice(
             f"Draft voucher {voucher_id} for {supplier_name}, {cents_to_euros(total)} euros on "
             f"{booking_date}, credited to account {counter_account}. It is not in the ledger; "
             "open Kitsas to check and approve it."
-            + (f" {business_id_note}" if business_id_note else "")
+            + "".join(f" {note}" for note in supplier_notes)
         ),
     }
+
+
+def _describe_state(tila: int) -> str:
+    """A plain-language name for a state delete_draft refuses to touch."""
+    return _NON_DELETABLE_STATE_NAMES.get(tila, f"in state {tila}, which delete_draft does not handle")
 
 
 def _check_deletable(conn, voucher_id: int) -> None:
     row = conn.execute("SELECT tila FROM Tosite WHERE id = ?", (voucher_id,)).fetchone()
     if row is None:
-        raise LedgerVoucherError(
-            f"There is no voucher {voucher_id} in this book. "
-            "Use list_vouchers to find the id of the voucher you meant."
-        )
-    if row["tila"] >= TILA_KIRJANPIDOSSA:
+        raise no_such_voucher_error(voucher_id)
+    tila = row["tila"]
+    if tila >= TILA_KIRJANPIDOSSA:
         raise LedgerVoucherError(
             f"Voucher {voucher_id} is already in the ledger and cannot be deleted here. "
             "Booked history is read-only through this server; do it in Kitsas if you "
             "really mean to."
+        )
+    if tila not in DELETABLE_STATES:
+        raise LedgerVoucherError(
+            f"Voucher {voucher_id} is {_describe_state(tila)}, not a document waiting in "
+            "its inbox or a draft someone is still working on. Only those "
+            f"(states {sorted(DELETABLE_STATES)}) can be deleted here; manage this "
+            "voucher in Kitsas directly instead."
         )
 
 
