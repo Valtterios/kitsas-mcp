@@ -12,6 +12,39 @@ def test_every_tool_has_a_description_and_a_handler():
         assert callable(spec["handler"]), f"{name} has no handler"
 
 
+def test_every_tool_declares_which_arguments_are_required():
+    for name, spec in TOOLS.items():
+        assert "required" in spec, f"{name} does not say which arguments are required"
+        for argument in spec["required"]:
+            assert argument in spec["schema"], f"{name} requires undeclared argument {argument}"
+
+
+def test_the_required_arguments_are_the_ones_the_handlers_cannot_do_without():
+    expected = {
+        "list_accounts": [],
+        "list_fiscal_years": [],
+        "find_supplier": ["query"],
+        "list_vouchers": ["date_from", "date_to"],
+        "get_voucher": ["voucher_id"],
+        "suggest_account": ["supplier"],
+        "add_purchase_invoice": ["supplier_name", "lines", "booking_date"],
+        "delete_draft": ["voucher_id"],
+        "bank_balance": ["on_date"],
+        "bank_movements": ["date_from", "date_to"],
+    }
+    assert {name: spec["required"] for name, spec in TOOLS.items()} == expected
+
+
+def test_suggest_account_accepts_a_partner_id_as_a_string_or_a_number(book_path):
+    # history.suggest_account takes the id path for "7" as well as 7, so the
+    # schema must not tell the model that only one of the two is allowed.
+    assert TOOLS["suggest_account"]["schema"]["supplier"]["type"] == ["string", "integer"]
+    by_string = call_tool(book_path, "suggest_account", {"supplier": "7"})
+    by_number = call_tool(book_path, "suggest_account", {"supplier": 7})
+    assert by_string == by_number
+    assert by_string[0]["account"] == 4590
+
+
 def test_the_expected_tools_are_registered():
     assert set(TOOLS) == {
         "list_accounts",
@@ -99,6 +132,14 @@ def test_build_server_registers_all_ten_tools_with_a_schema(book_path):
     for tool in result.tools:
         assert tool.description.strip(), f"{tool.name} has no description"
         assert tool.input_schema["type"] == "object"
+        # A schema with no "required" list tells the model that every
+        # argument is optional, including the ones the handler indexes.
+        assert tool.input_schema["required"] == TOOLS[tool.name]["required"]
+
+    advertised = {tool.name: tool.input_schema["required"] for tool in result.tools}
+    assert advertised["add_purchase_invoice"] == ["supplier_name", "lines", "booking_date"]
+    assert advertised["delete_draft"] == ["voucher_id"]
+    assert advertised["list_accounts"] == []
 
 
 def test_build_server_tools_call_handler_actually_runs_a_tool(book_path):

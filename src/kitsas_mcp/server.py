@@ -12,18 +12,21 @@ from .errors import KitsasError
 
 TOOLS = {
     "list_accounts": {
-        "description": "List the book's chart of accounts. Optional search matches the account name or number.",
-        "schema": {"search": {"type": "string", "description": "Substring of the name or number"}},
+        "description": "List the book's chart of accounts. Optional search matches a substring of the account name, or the start of the account number.",
+        "schema": {"search": {"type": "string", "description": "Substring of the name, or the first digits of the number"}},
+        "required": [],
         "handler": lambda book, args: accounts.list_accounts(book, args.get("search")),
     },
     "list_fiscal_years": {
         "description": "List fiscal years, showing which is current and which have been confirmed. Nothing can be written into a confirmed year.",
         "schema": {},
+        "required": [],
         "handler": lambda book, args: read.list_fiscal_years(book),
     },
     "find_supplier": {
         "description": "Find a partner by name, business id or IBAN.",
         "schema": {"query": {"type": "string"}},
+        "required": ["query"],
         "handler": lambda book, args: read.find_supplier(book, args["query"]),
     },
     "list_vouchers": {
@@ -35,6 +38,7 @@ TOOLS = {
             "account": {"type": "integer"},
             "state": {"type": "integer", "description": "20 for drafts this server created"},
         },
+        "required": ["date_from", "date_to"],
         "handler": lambda book, args: read.list_vouchers(
             book,
             args["date_from"],
@@ -47,6 +51,7 @@ TOOLS = {
     "get_voucher": {
         "description": "Get one voucher with all its entries and attachment names.",
         "schema": {"voucher_id": {"type": "integer"}},
+        "required": ["voucher_id"],
         "handler": lambda book, args: read.get_voucher(book, args["voucher_id"]),
     },
     "suggest_account": {
@@ -55,7 +60,13 @@ TOOLS = {
             "first. Empty for a supplier with no history. Call this before add_purchase_invoice "
             "so a recurring supplier keeps landing on the same account instead of a guess."
         ),
-        "schema": {"supplier": {"type": "string", "description": "Partner name or id"}},
+        "schema": {
+            "supplier": {
+                "type": ["string", "integer"],
+                "description": "Partner name, or the partner id as a number or a digit string",
+            }
+        },
+        "required": ["supplier"],
         "handler": lambda book, args: history.suggest_account(book, args["supplier"]),
     },
     "add_purchase_invoice": {
@@ -82,11 +93,18 @@ TOOLS = {
             "credit_account": {"type": "integer", "description": "Defaults to the bank account"},
             "pdf_path": {"type": "string", "description": "The original invoice, attached to the voucher"},
         },
+        "required": ["supplier_name", "lines", "booking_date"],
         "handler": lambda book, args: write.add_purchase_invoice(book, **args),
     },
     "delete_draft": {
-        "description": "Delete a draft this server created. Refuses any voucher already in the ledger.",
+        "description": (
+            "Delete a voucher that is not yet in the ledger. That includes drafts Kitsas "
+            "itself created, such as a document waiting in its inbox or a draft someone is "
+            "still working on, not only drafts this server wrote. Refuses any voucher that "
+            "has already reached the ledger."
+        ),
         "schema": {"voucher_id": {"type": "integer"}},
+        "required": ["voucher_id"],
         "handler": lambda book, args: write.delete_draft(book, args["voucher_id"]),
     },
     "bank_balance": {
@@ -95,6 +113,7 @@ TOOLS = {
             "on_date": {"type": "string", "description": "YYYY-MM-DD"},
             "account": {"type": "integer"},
         },
+        "required": ["on_date"],
         "handler": lambda book, args: reconcile.bank_balance(
             book, args["on_date"], args.get("account")
         ),
@@ -106,6 +125,7 @@ TOOLS = {
             "date_to": {"type": "string", "description": "YYYY-MM-DD"},
             "account": {"type": "integer"},
         },
+        "required": ["date_from", "date_to"],
         "handler": lambda book, args: reconcile.bank_movements(
             book, args["date_from"], args["date_to"], args.get("account")
         ),
@@ -166,6 +186,9 @@ def build_server(book_path):
                     inputSchema={
                         "type": "object",
                         "properties": spec["schema"],
+                        # Without this the model is told what every argument
+                        # means but never which ones it has to send.
+                        "required": spec["required"],
                     },
                 )
                 for name, spec in TOOLS.items()

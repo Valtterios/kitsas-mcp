@@ -23,7 +23,9 @@ writes a new voucher in an unnumbered draft state, exactly like a document
 Kitsas received but nobody has looked at yet. It gets no voucher number and
 is invisible to a normal ledger listing. A human still has to open Kitsas,
 review the draft, and approve it before it becomes part of the book's
-bookkeeping. Every other tool only reads.
+bookkeeping. `delete_draft` is the only other tool that writes, and it can
+only discard a voucher that has not reached the ledger. Every other tool
+only reads.
 
 ## Install
 
@@ -69,14 +71,14 @@ claude mcp add kitsas -e KITSAS_BOOK=/path/to/kirjanpito.kitsas -- uv run --dire
 
 ## Tools
 
-- `list_accounts` - list the book's chart of accounts, optionally filtered by a name or number substring.
+- `list_accounts` - list the book's chart of accounts, optionally filtered by a substring of the name or the first digits of the number.
 - `list_fiscal_years` - list fiscal years, showing which is current and which are confirmed and closed to writes.
 - `find_supplier` - find a partner by name, business id or IBAN.
 - `list_vouchers` - list vouchers in a date range, ledger vouchers by default.
 - `get_voucher` - get one voucher with all its entries and attachment names.
 - `suggest_account` - which expense accounts a supplier's earlier bills were booked to, most used first; call this before `add_purchase_invoice`.
 - `add_purchase_invoice` - create a purchase invoice as an unapproved draft; never enters the ledger on its own.
-- `delete_draft` - delete a draft this server created; refuses anything already in the ledger.
+- `delete_draft` - delete a voucher that is not yet in the ledger, including a draft Kitsas itself created; refuses anything already in the ledger.
 - `bank_balance` - the book's balance on the bank account as of a date, for checking against a statement.
 - `bank_movements` - every ledger entry on the bank account in a date range, with a running balance.
 
@@ -84,10 +86,19 @@ claude mcp add kitsas -e KITSAS_BOOK=/path/to/kirjanpito.kitsas -- uv run --dire
 
 These are the invariants the code enforces, not just intentions:
 
-- Every write lands in the draft state (`TILA_SAAPUNUT`) that Kitsas itself uses for an unapproved incoming document. Nothing this server writes can be mistaken for a booked entry.
+- No write this server makes ever lands at or above the ledger threshold. `add_purchase_invoice` writes in the draft state (`TILA_SAAPUNUT`) that Kitsas itself uses for an unapproved incoming document, and `delete_draft` writes the deleted state (`TILA_POISTETTU`) Kitsas uses for a discarded one. Nothing this server writes can be mistaken for a booked entry.
 - A draft never gets a voucher number (`tunniste`); Kitsas allocates that only when a human approves it. `add_purchase_invoice` verifies this by reading the row back before committing.
 - Nothing can be written into a confirmed fiscal year. `add_purchase_invoice` looks up the fiscal year for the booking date and refuses if it has been confirmed, naming the confirmation date.
 - A backup of the book is taken before every write transaction, alongside its `-wal`/`-shm` sidecars if present. A write is refused, and the book left untouched, if the backup cannot be made.
 - Anything already in the ledger is read-only through this server. `delete_draft` refuses a voucher whose state has reached the ledger threshold, both before and again inside the write transaction, and no update statement it issues can touch such a voucher even on its own.
 - An IBAN already bound to one partner is never silently re-pointed to another. `add_purchase_invoice` refuses instead of overwriting the binding, naming who the IBAN currently belongs to.
 - An attachment over 20 MB is refused before it is even read from disk, so an oversized file is never copied into the book or into every future backup of it.
+- A business id read off an invoice is written onto an existing partner only when that partner has no business id yet and no vouchers in the ledger. A business id already on file is left alone, and a partner with ledger history is refused by name rather than corrected here, because a wrong value read from a scan would otherwise be undoable except by restoring a backup.
+
+### Backups accumulate
+
+Every write takes its own timestamped `.bak` copy of the whole book, plus its
+`-wal`/`-shm` sidecars, in the same folder as the book. Nothing prunes them.
+Each copy contains every PDF embedded in the book, so a book with many
+attachments grows a folder of large duplicates over a year of use. Tidy the
+old `.kitsas.*.bak` files yourself now and then, keeping the recent ones.
