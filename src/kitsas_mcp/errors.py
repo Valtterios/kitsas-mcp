@@ -41,6 +41,10 @@ class AccountNotFoundError(KitsasError):
     pass
 
 
+class LineFormatError(KitsasError):
+    pass
+
+
 class LedgerVoucherError(KitsasError):
     pass
 

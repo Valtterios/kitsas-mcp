@@ -1,13 +1,17 @@
+import sqlite3
 from pathlib import Path
 
 import pytest
 
+from kitsas_mcp import write as write_module
 from kitsas_mcp.errors import (
     AccountNotFoundError,
+    AmbiguousSupplierError,
     AmountError,
     ClosedFiscalYearError,
     KitsasError,
     LedgerVoucherError,
+    LineFormatError,
     NoFiscalYearError,
     UnbalancedVoucherError,
 )
@@ -157,10 +161,24 @@ def test_refuses_an_empty_bill(book):
 
 
 def test_refuses_a_line_that_is_not_positive(book):
-    with pytest.raises(UnbalancedVoucherError):
+    with pytest.raises(AmountError):
         add_purchase_invoice(book, **{**BILL, "lines": [{"account": 4000, "amount": "0.00"}]})
-    with pytest.raises(UnbalancedVoucherError):
+    with pytest.raises(AmountError):
         add_purchase_invoice(book, **{**BILL, "lines": [{"account": 4000, "amount": "-5.00"}]})
+
+
+def test_refuses_a_malformed_line(book):
+    with pytest.raises(LineFormatError):
+        add_purchase_invoice(book, **{**BILL, "lines": [{"amount": "1.00"}]})
+    with pytest.raises(LineFormatError):
+        add_purchase_invoice(book, **{**BILL, "lines": [{"account": 4000}]})
+    with pytest.raises(LineFormatError):
+        add_purchase_invoice(book, **{**BILL, "lines": ["4000: 1.00"]})
+
+
+def test_refuses_an_empty_supplier_name(book):
+    with pytest.raises(LineFormatError):
+        add_purchase_invoice(book, **{**BILL, "supplier_name": "   "})
 
 
 def test_refuses_an_amount_that_is_not_money(book):
@@ -247,3 +265,209 @@ def test_the_summary_says_the_voucher_is_not_in_the_ledger(book):
     assert result["lines"] == [{"account": 4000, "amount": "42.90"}]
     assert result["attachment"] is None
     assert "not in the ledger" in result["summary"]
+
+
+# -- Finding 1: an existing IBAN binding is never re-pointed -----------------
+
+
+def test_a_new_iban_is_bound_to_the_new_supplier(book):
+    add_purchase_invoice(book, **{**BILL, "iban": "FI21 1234 5600 0007 85"})
+    with book.connect_read() as conn:
+        row = conn.execute(
+            "SELECT k.nimi FROM KumppaniIban i JOIN Kumppani k ON k.id = i.kumppani "
+            "WHERE i.iban = 'FI2112345600000785'"
+        ).fetchone()
+    assert row["nimi"] == "Telia Finland Oyj"
+
+
+def test_rebinding_the_same_iban_to_the_same_supplier_is_a_no_op(book):
+    add_purchase_invoice(book, **{**BILL, "iban": "FI21 1234 5600 0007 85"})
+    add_purchase_invoice(book, **{**BILL, "iban": "FI2112345600000785"})
+    with book.connect_read() as conn:
+        rows = conn.execute(
+            "SELECT i.iban FROM KumppaniIban i JOIN Kumppani k ON k.id = i.kumppani "
+            "WHERE k.nimi = 'Telia Finland Oyj'"
+        ).fetchall()
+    assert [r["iban"] for r in rows] == ["FI2112345600000785"]
+
+
+def test_refuses_to_move_an_iban_that_belongs_to_another_partner(book):
+    # FI5689199710000724 is seeded against Verohallinto, the tax authority.
+    with pytest.raises(KitsasError) as excinfo:
+        add_purchase_invoice(book, **{**BILL, "iban": "FI56 8919 9710 000724"})
+    message = str(excinfo.value)
+    assert "Verohallinto" in message and "Telia Finland Oyj" in message
+
+    with book.connect_read() as conn:
+        owner = conn.execute(
+            "SELECT k.nimi FROM KumppaniIban i JOIN Kumppani k ON k.id = i.kumppani "
+            "WHERE i.iban = 'FI5689199710000724'"
+        ).fetchone()
+        created = conn.execute(
+            "SELECT count(*) FROM Kumppani WHERE nimi = 'Telia Finland Oyj'"
+        ).fetchone()[0]
+    assert owner["nimi"] == "Verohallinto", "the tax authority's IBAN must not move"
+    assert created == 0, "the refusal must roll the whole transaction back"
+
+
+# -- Finding 2: partner matching does not choose silently --------------------
+
+
+def test_a_supplier_name_with_stray_whitespace_reuses_the_existing_partner(book):
+    add_purchase_invoice(book, **{**BILL, "supplier_name": "  Hetzner  "})
+    with book.connect_read() as conn:
+        rows = conn.execute("SELECT id FROM Kumppani WHERE trim(nimi) = 'Hetzner'").fetchall()
+    assert len(rows) == 1, "trailing whitespace must not create a second partner"
+
+
+def test_two_partners_differing_only_by_case_are_refused(book, book_path):
+    conn = sqlite3.connect(book_path)
+    conn.execute("INSERT INTO Kumppani (nimi, json) VALUES ('HETZNER', '{}')")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(AmbiguousSupplierError) as excinfo:
+        add_purchase_invoice(book, **{**BILL, "supplier_name": "Hetzner"})
+    message = str(excinfo.value)
+    assert "Hetzner" in message and "HETZNER" in message
+
+
+# -- Finding 3: the attachment size is capped --------------------------------
+
+
+def test_refuses_an_attachment_over_the_size_limit(book, tmp_path):
+    huge = tmp_path / "scan.pdf"
+    with open(huge, "wb") as handle:
+        handle.truncate(write_module.MAX_ATTACHMENT_BYTES + 1)
+
+    with pytest.raises(KitsasError) as excinfo:
+        add_purchase_invoice(book, **{**BILL, "pdf_path": str(huge)})
+    message = str(excinfo.value)
+    assert str(write_module.MAX_ATTACHMENT_BYTES + 1) in message
+    assert str(write_module.MAX_ATTACHMENT_BYTES) in message
+
+    with book.connect_read() as conn:
+        assert conn.execute("SELECT count(*) FROM Tosite").fetchone()[0] == 4
+
+
+def test_an_attachment_at_the_limit_is_accepted(book, tmp_path):
+    ok = tmp_path / "scan.pdf"
+    with open(ok, "wb") as handle:
+        handle.truncate(write_module.MAX_ATTACHMENT_BYTES)
+    result = add_purchase_invoice(book, **{**BILL, "pdf_path": str(ok)})
+    assert result["attachment"]["bytes"] == write_module.MAX_ATTACHMENT_BYTES
+
+
+# -- Finding 4: the two guards that nothing else catches ---------------------
+
+
+def test_verify_draft_catches_a_tosite_insert_that_omits_tila(book, monkeypatch):
+    """Drop the tila column from the INSERT, as a careless refactor would.
+
+    Tosite.tila has DEFAULT 100 in the Kitsas schema, so omitting the column
+    files the voucher straight into the ledger. The sarja column takes the
+    third parameter so the statement's arity is unchanged and only tila is
+    lost. This test fails if _verify_draft is removed.
+    """
+    monkeypatch.setattr(
+        write_module,
+        "TOSITE_INSERT",
+        "INSERT INTO Tosite (pvm, tyyppi, sarja, tunniste, otsikko, kumppani, laskupvm, "
+        "erapvm, viite, json) VALUES (?,?,?,NULL,?,?,?,?,?,'{}')",
+    )
+
+    with pytest.raises(LedgerVoucherError) as excinfo:
+        add_purchase_invoice(book, **BILL)
+    assert "unnumbered draft" in str(excinfo.value)
+
+    with book.connect_read() as conn:
+        assert conn.execute("SELECT count(*) FROM Tosite").fetchone()[0] == 4
+        assert conn.execute("SELECT count(*) FROM Tosite WHERE tila >= 100").fetchone()[0] == 2
+
+
+def test_verify_draft_catches_a_tosite_insert_that_allocates_a_number(book, monkeypatch):
+    """Write a tunniste, which Kitsas alone may do. Fails if _verify_draft is removed."""
+    monkeypatch.setattr(
+        write_module,
+        "TOSITE_INSERT",
+        "INSERT INTO Tosite (pvm, tyyppi, tila, tunniste, otsikko, kumppani, laskupvm, "
+        "erapvm, viite, json) VALUES (?,?,?,99,?,?,?,?,?,'{}')",
+    )
+
+    with pytest.raises(LedgerVoucherError):
+        add_purchase_invoice(book, **BILL)
+
+    with book.connect_read() as conn:
+        assert conn.execute("SELECT count(*) FROM Tosite").fetchone()[0] == 4
+
+
+def test_verify_draft_rejects_an_empty_or_unbalanced_voucher(book, book_path):
+    """The balance readback tested directly, against rows it did not write.
+
+    sqlite3.Connection is an immutable type, so its execute cannot be patched
+    to corrupt an amount mid-transaction the way TOSITE_INSERT can be swapped.
+    The guard's own logic is exercised here instead. An empty voucher is the
+    case that matters: it satisfies 0 == 0 and would pass a bare equality
+    check, so this fails if the debit > 0 half of the guard is removed.
+    """
+    conn = sqlite3.connect(book_path)
+    conn.execute(
+        "INSERT INTO Tosite (id, pvm, tyyppi, tila, tunniste) VALUES (5,'2026-06-01',100,20,NULL)"
+    )
+    conn.execute(
+        "INSERT INTO Tosite (id, pvm, tyyppi, tila, tunniste) VALUES (6,'2026-06-01',100,20,NULL)"
+    )
+    conn.execute(
+        "INSERT INTO Vienti (rivi, tosite, tyyppi, pvm, tili, kohdennus, debetsnt, kreditsnt) "
+        "VALUES (1,6,102,'2026-06-01',1910,0,0,400)"
+    )
+    conn.execute(
+        "INSERT INTO Vienti (rivi, tosite, tyyppi, pvm, tili, kohdennus, debetsnt, kreditsnt) "
+        "VALUES (2,6,101,'2026-06-01',4000,0,1000,0)"
+    )
+    conn.commit()
+    conn.close()
+
+    with book.connect_read() as conn:
+        write_module._verify_draft(conn, 3)  # the balanced fixture draft passes
+
+        with pytest.raises(UnbalancedVoucherError) as empty:
+            write_module._verify_draft(conn, 5)  # a draft with no entries at all
+
+        with pytest.raises(UnbalancedVoucherError):
+            write_module._verify_draft(conn, 6)  # debit 1000 against credit 400
+
+    assert "no expense at all" in str(empty.value)
+
+
+def test_delete_draft_rechecks_inside_the_transaction(book, monkeypatch):
+    """The read-only pre-check passes, the in-transaction one must still fire.
+
+    The first call stands in for a state that was deletable when it was read.
+    If the second, in-transaction _check_deletable call is removed, nothing
+    raises and this test fails.
+    """
+    real_check = write_module._check_deletable
+    calls = []
+
+    def once_permissive(conn, voucher_id):
+        calls.append(voucher_id)
+        if len(calls) == 1:
+            return  # the pre-check saw a deletable voucher
+        real_check(conn, voucher_id)
+
+    monkeypatch.setattr(write_module, "_check_deletable", once_permissive)
+
+    with pytest.raises(LedgerVoucherError) as excinfo:
+        delete_draft(book, 1)
+    assert "already in the ledger" in str(excinfo.value)
+    assert len(calls) == 2, "the write transaction must re-check, not trust the pre-check"
+    assert get_voucher(book, 1)["state"] == 100
+
+
+def test_the_update_statement_alone_cannot_touch_a_ledger_voucher(book, monkeypatch):
+    """With both guards bypassed, the UPDATE's own tila predicate still holds."""
+    monkeypatch.setattr(write_module, "_check_deletable", lambda conn, voucher_id: None)
+
+    delete_draft(book, 1)
+    assert get_voucher(book, 1)["state"] == 100, "the UPDATE must carry its own tila predicate"

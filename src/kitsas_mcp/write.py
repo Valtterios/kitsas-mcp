@@ -4,6 +4,10 @@ Everything written here lands at TILA_SAAPUNUT with no tunniste, which is what
 Kitsas calls an incoming, unapproved document. Kitsas itself moves the voucher
 into the ledger and allocates its number when a human approves it. This server
 never does either, and never touches a voucher that is already in the ledger.
+
+Nothing outside the voucher being created is ever rewritten. A partner may be
+created, and a blank business id filled in, but an existing IBAN binding is
+never re-pointed: this module refuses instead.
 """
 
 import hashlib
@@ -21,13 +25,27 @@ from .constants import (
     VIENTI_OSTO_VASTAKIRJAUS,
 )
 from .errors import (
+    AmbiguousSupplierError,
+    AmountError,
     ClosedFiscalYearError,
     KitsasError,
     LedgerVoucherError,
+    LineFormatError,
     UnbalancedVoucherError,
 )
 from .money import cents_to_euros, euros_to_cents
 from .read import fiscal_year_for
+
+# An invoice scan is a few hundred kilobytes. Anything past this is a wrong
+# path, and it would be copied into every future backup of the book forever.
+MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
+
+# Module level so a test can substitute a deliberately broken variant and prove
+# that _verify_draft catches it. See test_write.py.
+TOSITE_INSERT = (
+    "INSERT INTO Tosite (pvm, tyyppi, tila, tunniste, otsikko, kumppani, laskupvm, "
+    "erapvm, viite, json) VALUES (?,?,?,NULL,?,?,?,?,?,'{}')"
+)
 
 
 def _check_fiscal_year(book, booking_date: str) -> None:
@@ -53,13 +71,13 @@ def _prepare_lines(book, lines, description, supplier_name) -> list[tuple]:
         try:
             account = line["account"]
         except (TypeError, KeyError):
-            raise UnbalancedVoucherError(
+            raise LineFormatError(
                 f"The expense line {line!r} has no 'account'. Every line needs an "
                 "'account' number and an 'amount', for example "
                 "{'account': 4000, 'amount': '42.90'}."
             ) from None
         if "amount" not in line:
-            raise UnbalancedVoucherError(
+            raise LineFormatError(
                 f"The expense line for account {account} has no 'amount'. Add it as a "
                 "string like '42.90'."
             )
@@ -67,7 +85,7 @@ def _prepare_lines(book, lines, description, supplier_name) -> list[tuple]:
         get_account(book, account)  # raises AccountNotFoundError
         cents = euros_to_cents(line["amount"])  # raises AmountError
         if cents <= 0:
-            raise UnbalancedVoucherError(
+            raise AmountError(
                 f"The line for account {account} is {line['amount']}, which is not a "
                 "positive amount. Split the bill so every line is a positive expense, "
                 "or record a credit note in Kitsas instead."
@@ -82,46 +100,103 @@ def _read_attachment(pdf_path: str) -> tuple[str, str, bytes]:
     """Read the attachment before the transaction opens, so a bad path costs nothing."""
     path = Path(pdf_path)
     try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise KitsasError(
+            f"Could not read the attachment {path.name} at {path}: {exc}. "
+            "Check the path and that the file is readable, then try again."
+        ) from None
+    if size == 0:
+        raise KitsasError(
+            f"The attachment {path.name} is empty. Attach the real invoice file, "
+            "or leave pdf_path out."
+        )
+    # Checked from the directory entry, so an enormous file is never read at all.
+    if size > MAX_ATTACHMENT_BYTES:
+        raise KitsasError(
+            f"The attachment {path.name} is {size} bytes, over the "
+            f"{MAX_ATTACHMENT_BYTES} byte limit. It would be stored inside the book "
+            "and copied into every future backup. Attach a smaller scan of the "
+            "invoice, or leave pdf_path out."
+        )
+
+    try:
         data = path.read_bytes()
     except OSError as exc:
         raise KitsasError(
             f"Could not read the attachment {path.name} at {path}: {exc}. "
             "Check the path and that the file is readable, then try again."
         ) from None
-    if not data:
-        raise KitsasError(
-            f"The attachment {path.name} is empty. Attach the real invoice file, "
-            "or leave pdf_path out."
-        )
     mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
     return path.name, mime, data
 
 
-def _upsert_supplier(conn, name: str, business_id, iban) -> int:
-    row = conn.execute(
-        "SELECT id FROM Kumppani WHERE lower(nimi) = lower(?) ORDER BY id LIMIT 1", (name,)
+def _normalise_iban(iban) -> str:
+    return str(iban).replace(" ", "").replace("\xa0", "").upper()
+
+
+def _find_supplier_id(conn, name: str) -> int | None:
+    """Resolve a partner by name, refusing to choose between real alternatives."""
+    rows = conn.execute(
+        "SELECT id, nimi FROM Kumppani WHERE lower(trim(nimi)) = lower(?) ORDER BY id",
+        (name,),
+    ).fetchall()
+    if not rows:
+        return None
+    if len(rows) > 1:
+        names = ", ".join(f"{r['nimi']!r} (id {r['id']})" for r in rows)
+        raise AmbiguousSupplierError(
+            f"{name!r} matches {len(rows)} partners in this book that differ only by "
+            f"case or spacing: {names}. Merge or rename them in Kitsas, or pass a name "
+            "that matches exactly one of them."
+        )
+    return rows[0]["id"]
+
+
+def _bind_iban(conn, supplier_id: int, supplier_name: str, iban) -> None:
+    """Bind an IBAN to this partner. Never re-point one that belongs elsewhere.
+
+    A KumppaniIban row is pre-existing book data outside the voucher being
+    written. Silently reassigning one would, for a single mistyped digit, move
+    the tax authority's bank account onto whatever supplier is being invoiced.
+    """
+    normalised = _normalise_iban(iban)
+    owner = conn.execute(
+        "SELECT i.kumppani, k.nimi FROM KumppaniIban i "
+        "LEFT JOIN Kumppani k ON k.id = i.kumppani WHERE i.iban = ?",
+        (normalised,),
     ).fetchone()
-    if row is None:
+
+    if owner is not None:
+        if owner["kumppani"] == supplier_id:
+            return  # Already bound to this partner. Nothing to do.
+        raise KitsasError(
+            f"IBAN {normalised} already belongs to {owner['nimi']!r} in this book, not "
+            f"to {supplier_name!r}. Check the IBAN, or move it in Kitsas if it really "
+            "has changed hands."
+        )
+
+    conn.execute(
+        "INSERT INTO KumppaniIban (iban, kumppani) VALUES (?,?)", (normalised, supplier_id)
+    )
+
+
+def _upsert_supplier(conn, name: str, business_id, iban) -> int:
+    supplier_id = _find_supplier_id(conn, name)
+    if supplier_id is None:
         cursor = conn.execute(
             "INSERT INTO Kumppani (nimi, alvtunnus, json) VALUES (?,?,?)",
             (name, business_id, "{}"),
         )
         supplier_id = cursor.lastrowid
-    else:
-        supplier_id = row["id"]
-        if business_id:
-            conn.execute(
-                "UPDATE Kumppani SET alvtunnus = ? WHERE id = ? AND coalesce(alvtunnus,'') = ''",
-                (business_id, supplier_id),
-            )
+    elif business_id:
+        conn.execute(
+            "UPDATE Kumppani SET alvtunnus = ? WHERE id = ? AND coalesce(alvtunnus,'') = ''",
+            (business_id, supplier_id),
+        )
 
     if iban:
-        normalised = str(iban).replace(" ", "").replace("\xa0", "").upper()
-        conn.execute(
-            "INSERT INTO KumppaniIban (iban, kumppani) VALUES (?,?) "
-            "ON CONFLICT (iban) DO UPDATE SET kumppani = excluded.kumppani",
-            (normalised, supplier_id),
-        )
+        _bind_iban(conn, supplier_id, name, iban)
     return supplier_id
 
 
@@ -157,10 +232,13 @@ def _verify_draft(conn, voucher_id: int) -> None:
         "FROM Vienti WHERE tosite = ?",
         (voucher_id,),
     ).fetchone()
-    if debit != credit:
+    # debit > 0 as well as debit == credit, so that an empty voucher, which
+    # satisfies 0 == 0, cannot pass this check on its own.
+    if debit <= 0 or debit != credit:
         raise UnbalancedVoucherError(
-            f"Debits {cents_to_euros(debit)} do not equal credits {cents_to_euros(credit)}. "
-            "Nothing was written. Check that the expense lines add up to the invoice total."
+            f"Debits {cents_to_euros(debit)} do not equal credits {cents_to_euros(credit)}, "
+            "or the voucher has no expense at all. Nothing was written. Check that the "
+            "expense lines add up to the invoice total."
         )
 
 
@@ -182,6 +260,13 @@ def add_purchase_invoice(
     """Create a purchase invoice as a draft. Kitsas approves it into the ledger."""
     _check_fiscal_year(book, booking_date)
 
+    supplier_name = str(supplier_name).strip()
+    if not supplier_name:
+        raise LineFormatError(
+            "The supplier name is empty. Pass the supplier's name as it should appear "
+            "on the voucher, for example 'Telia Finland Oyj'."
+        )
+
     prepared = _prepare_lines(book, lines, description, supplier_name)
     total = sum(cents for _, cents, _ in prepared)
 
@@ -195,8 +280,7 @@ def add_purchase_invoice(
         supplier_id = _upsert_supplier(conn, supplier_name, business_id, iban)
 
         cursor = conn.execute(
-            "INSERT INTO Tosite (pvm, tyyppi, tila, tunniste, otsikko, kumppani, laskupvm, "
-            "erapvm, viite, json) VALUES (?,?,?,NULL,?,?,?,?,?,'{}')",
+            TOSITE_INSERT,
             (
                 booking_date,
                 TOSITE_MENO,
@@ -294,7 +378,12 @@ def delete_draft(book, voucher_id: int) -> dict:
 
     with book.connect_write() as conn:
         _check_deletable(conn, voucher_id)
-        conn.execute("UPDATE Tosite SET tila = ? WHERE id = ?", (TILA_POISTETTU, voucher_id))
+        # The tila predicate repeats the check the statement depends on, so the
+        # UPDATE cannot touch a ledger voucher even read on its own.
+        conn.execute(
+            "UPDATE Tosite SET tila = ? WHERE id = ? AND tila < ?",
+            (TILA_POISTETTU, voucher_id, TILA_KIRJANPIDOSSA),
+        )
         conn.execute(
             "INSERT INTO Tositeloki (tosite, tila) VALUES (?,?)", (voucher_id, TILA_POISTETTU)
         )
