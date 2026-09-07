@@ -145,25 +145,58 @@ def resolve_book_path(argument):
     return Path(path)
 
 
+def _validate_arguments(name, spec, args):
+    """Check `args` against what this tool declared, before the handler ever runs.
+
+    A KeyError or TypeError that only happens because the caller left out a
+    required argument, or sent one that does not exist, must be reported as
+    the caller's mistake. Checking the declared required list and schema
+    keys up front, before the handler runs, means any KeyError or TypeError
+    that still escapes the handler afterwards cannot be one of these two
+    caller mistakes: it is a bug inside the handler itself, and call_tool
+    reports it as such instead of blaming the caller's arguments.
+
+    Returns an error message, or None if `args` is fine.
+    """
+    for required in spec["required"]:
+        if required not in args:
+            return f"Missing required argument {required!r} for {name}. Pass it and try again."
+    unexpected = sorted(set(args) - set(spec["schema"]))
+    if unexpected:
+        valid = ", ".join(sorted(spec["schema"])) or "(none)"
+        return (
+            f"{name} does not accept argument {unexpected[0]!r}. "
+            f"Its arguments are: {valid}."
+        )
+    return None
+
+
 def call_tool(book_path, name, args):
     """Run a tool and return plain data, turning known errors into messages."""
     spec = TOOLS.get(name)
     if spec is None:
         return {"error": f"There is no tool called {name}."}
+    validation_error = _validate_arguments(name, spec, args)
+    if validation_error is not None:
+        return {"error": validation_error}
     try:
         return spec["handler"](Book(book_path), args)
     except KitsasError as exc:
         return {"error": str(exc)}
-    except KeyError as exc:
-        return {"error": f"Missing required argument {exc} for {name}."}
-    except TypeError as exc:
-        # A call whose arguments do not match the underlying function's
-        # signature (an unexpected argument name, most often) surfaces here
-        # as a raw TypeError rather than a KitsasError, because it never
-        # reaches our own validation code. Without this, it would escape
-        # call_tool as a traceback instead of the {"error": ...} shape every
-        # other failure uses.
-        return {"error": f"{name} was called with bad arguments {args!r}: {exc}"}
+    except (KeyError, TypeError) as exc:
+        # Arguments were already checked above against this tool's required
+        # list and its schema's argument names, so a KeyError or TypeError
+        # reaching here did not come from a missing or unexpected argument.
+        # It is a bug inside the handler, not something the caller did
+        # wrong, so it is labelled as an internal error rather than
+        # reported as a bad-arguments message that would send the caller
+        # back to double-check arguments that were actually correct.
+        return {
+            "error": (
+                f"Internal error in {name}: {exc!r}. This is a bug in the tool, "
+                "not in your arguments; it should be reported."
+            )
+        }
 
 
 def build_server(book_path):
@@ -200,8 +233,16 @@ def build_server(book_path):
 
     async def on_call_tool(ctx, params):
         result = call_tool(book_path, params.name, params.arguments or {})
+        # call_tool never raises: every failure it reports comes back as a
+        # dict with an "error" key instead. Leaving is_error at its default
+        # (False) would tell an MCP client that a refused write - a
+        # confirmed fiscal year, a locked book, an unknown account -
+        # completed successfully, because the failure is otherwise visible
+        # only by inspecting the JSON payload for that key.
+        is_error = isinstance(result, dict) and "error" in result
         return CallToolResult(
-            content=[TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+            content=[TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))],
+            is_error=is_error,
         )
 
     return Server("kitsas-mcp", on_list_tools=on_list_tools, on_call_tool=on_call_tool)

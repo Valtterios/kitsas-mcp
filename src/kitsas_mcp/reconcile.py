@@ -6,20 +6,33 @@ asserts a payment; this is how a wrong one gets found.
 """
 
 from .accounts import account_on, default_bank_account_on
-from .constants import TILA_KIRJANPIDOSSA
+from .constants import TILA_KIRJANPIDOSSA, TILITYYPPI_PANKKI
 from .dates import parse_iso_date
+from .errors import NotABankAccountError
 from .money import cents_to_euros
 
 
 def _resolve_account(conn, account):
-    """An account passed explicitly is checked against Tili.
+    """An account passed explicitly is checked against Tili, and that it is a bank account.
 
     Takes the connection the caller already opened for the balance query
     itself, so resolving the account (explicit or default) needs no
     connection of its own.
+
+    Both bank_balance and bank_movements advertise themselves as reporting
+    on the bank account, for checking against a real bank statement. Any
+    other account number that happens to exist (an expense account, a
+    payables account) would still produce a number, but not a bank balance,
+    so it is refused here rather than silently answered.
     """
     if account is not None:
-        account_on(conn, account)  # raises AccountNotFoundError for a bad number
+        found = account_on(conn, account)  # raises AccountNotFoundError for a bad number
+        if found["type"] != TILITYYPPI_PANKKI:
+            raise NotABankAccountError(
+                f"Account {account} ({found['name'] or 'unnamed'}) is type {found['type']!r}, "
+                f"not a bank account (type {TILITYYPPI_PANKKI!r}). Pass the number of an actual "
+                "bank account, or omit account to use the book's default bank account."
+            )
         return account
     return default_bank_account_on(conn)
 

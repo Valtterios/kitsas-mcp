@@ -112,6 +112,48 @@ def test_call_tool_returns_an_error_for_an_unexpected_argument_name(book_path):
     assert "add_purchase_invoice" in result["error"]
 
 
+def test_call_tool_returns_an_error_for_a_missing_required_argument(book_path):
+    # date_to is required and missing. This must name date_to specifically,
+    # not blame the tool call in general or crash with a raw KeyError.
+    result = call_tool(book_path, "list_vouchers", {"date_from": "2026-01-01"})
+    assert "error" in result
+    assert "date_to" in result["error"]
+    assert "list_vouchers" in result["error"]
+
+
+def test_call_tool_returns_an_error_for_an_unexpected_argument_on_a_tool_with_only_optional_arguments(book_path):
+    # list_accounts declares no required arguments, but "serach" (a typo of
+    # "search") is still not one of its declared arguments, and must be
+    # refused rather than silently ignored.
+    result = call_tool(book_path, "list_accounts", {"serach": "Pankki"})
+    assert "error" in result
+    assert "serach" in result["error"]
+
+
+def test_call_tool_labels_an_internal_error_distinctly_from_a_caller_mistake(book_path):
+    # booking_date is a genuinely declared, present argument, so it passes
+    # argument validation; but a date object rather than a string reaches
+    # json.dumps deep inside the write transaction and raises a bare
+    # TypeError there. That TypeError is a bug surface, not a sign the
+    # caller passed a wrong argument NAME, so its message must say so
+    # instead of claiming "bad arguments", which would send the caller off
+    # to recheck arguments that were, in fact, correctly named.
+    from datetime import date
+
+    result = call_tool(
+        book_path,
+        "add_purchase_invoice",
+        {
+            "supplier_name": "Telia Finland Oyj",
+            "lines": [{"account": 4590, "amount": "10.00"}],
+            "booking_date": date(2026, 1, 15),
+        },
+    )
+    assert "error" in result
+    assert "internal error" in result["error"].lower()
+    assert "bad arguments" not in result["error"].lower()
+
+
 def test_build_server_registers_all_ten_tools_with_a_schema(book_path):
     # Smoke test for the part call_tool's own tests never touch: the actual
     # mcp.server.Server wiring. The installed mcp package (2.x) registers
@@ -166,5 +208,30 @@ def test_build_server_tools_call_handler_actually_runs_a_tool(book_path):
 
     bad_params = CallToolRequestParams(name="drop_everything", arguments={})
     bad_result = asyncio.run(call_tool_entry.handler(None, bad_params))
+    # A refused call must be flagged as an error on the CallToolResult
+    # itself, not only inside the JSON payload: a client that branches on
+    # is_error (for retry policy, for surfacing failure in the UI, for not
+    # counting a refusal as a completed write) would otherwise see this as
+    # a success that merely happens to carry an "error" key.
+    assert bad_result.is_error is True
     payload = json.loads(bad_result.content[0].text)
     assert "drop_everything" in payload["error"]
+
+
+def test_on_call_tool_reports_is_error_true_for_a_refused_write(book_path):
+    # Deleting an already-in-the-ledger voucher is refused by write.py, not
+    # by call_tool's own argument validation. This drives the real
+    # tools/call handler end to end for that refusal, to confirm the
+    # refusal comes back on the wire as is_error True (previously always
+    # False), with the reason still readable in the text content.
+    from mcp.types import CallToolRequestParams
+
+    server = build_server(book_path)
+    call_tool_entry = server.get_request_handler("tools/call")
+
+    params = CallToolRequestParams(name="delete_draft", arguments={"voucher_id": 1})
+    result = asyncio.run(call_tool_entry.handler(None, params))
+
+    assert result.is_error is True
+    payload = json.loads(result.content[0].text)
+    assert payload["error"].startswith("Voucher 1 is already in the ledger")

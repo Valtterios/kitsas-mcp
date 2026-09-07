@@ -41,6 +41,10 @@ class AccountNotFoundError(KitsasError):
     pass
 
 
+class NotABankAccountError(KitsasError):
+    pass
+
+
 class LineFormatError(KitsasError):
     pass
 
