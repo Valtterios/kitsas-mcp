@@ -1,7 +1,11 @@
 """What account has this supplier's spending been booked to before?"""
 
 from .constants import TILA_KIRJANPIDOSSA, TOSITE_MENO
-from .errors import AmbiguousSupplierError
+from .partners import resolve_partner
+
+# suggest_account's caller can pass an id, so that is the way out of an
+# ambiguity here.
+AMBIGUITY_REMEDY = "Pass the partner id instead; find_supplier lists them."
 
 SQL = """
 SELECT v.tili AS tili,
@@ -20,38 +24,12 @@ ORDER BY lkm DESC, viimeksi DESC
 """
 
 
-def _ambiguous(supplier, rows) -> AmbiguousSupplierError:
-    """One message for both match kinds: never choose between real partners."""
-    names = ", ".join(f"{r['nimi']} (id {r['id']})" for r in rows)
-    return AmbiguousSupplierError(
-        f"{supplier!r} matches {len(rows)} partners in this book ({names}). "
-        f"Pass the partner id instead; find_supplier lists them."
-    )
-
-
 def _resolve_supplier_id(conn, supplier):
+    """The partner id, by id or by name. The name rule is shared with write."""
     if isinstance(supplier, int):
         return supplier
-    # An exact name match can still be several partners, because the match is
-    # case-insensitive: 'Hetzner' and 'HETZNER' are two rows in the book and
-    # two different partners on paper. Picking the lower id would silently
-    # attribute one partner's history to the other.
-    rows = conn.execute(
-        "SELECT id, nimi FROM Kumppani WHERE lower(nimi) = lower(?) ORDER BY id", (supplier,)
-    ).fetchall()
-    if len(rows) > 1:
-        raise _ambiguous(supplier, rows)
-    if len(rows) == 1:
-        return rows[0]["id"]
-    rows = conn.execute(
-        "SELECT id, nimi FROM Kumppani WHERE lower(nimi) LIKE lower(?) ORDER BY id",
-        (f"%{supplier}%",),
-    ).fetchall()
-    if len(rows) == 0:
-        return None
-    if len(rows) > 1:
-        raise _ambiguous(supplier, rows)
-    return rows[0]["id"]
+    match = resolve_partner(conn, supplier, remedy=AMBIGUITY_REMEDY)
+    return None if match is None else match.id
 
 
 def suggest_account(book, supplier) -> list[dict]:

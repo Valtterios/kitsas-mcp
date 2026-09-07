@@ -7,6 +7,7 @@ from .constants import TILA_KIRJANPIDOSSA
 from .dates import parse_iso_date
 from .errors import NoFiscalYearError
 from .money import cents_to_euros
+from .partners import ESCAPE_CLAUSE, contains_pattern
 
 
 def list_fiscal_years(book) -> list[dict]:
@@ -38,14 +39,22 @@ def fiscal_year_for(book, when: str) -> dict:
 
 
 def find_supplier(book, query: str) -> list[dict]:
+    """Every partner whose name contains the query, or whose business id or IBAN is it.
+
+    A browsing tool: it returns a list, and finding several partners is a
+    result, not an error. The name matching is the same rule partners.py
+    resolves a single supplier with, so what this lists and what
+    suggest_account and add_purchase_invoice pick are never at odds.
+    """
     with book.connect_read() as conn:
         rows = conn.execute(
             "SELECT k.id, k.nimi, k.alvtunnus FROM Kumppani k "
             "LEFT JOIN KumppaniIban i ON i.kumppani = k.id "
-            "WHERE lower(k.nimi) LIKE lower(?) OR lower(coalesce(k.alvtunnus,'')) = lower(?) "
+            f"WHERE lower(trim(k.nimi)) LIKE lower(?) {ESCAPE_CLAUSE} "
+            "OR lower(coalesce(k.alvtunnus,'')) = lower(?) "
             "OR replace(lower(coalesce(i.iban,'')),' ','') = replace(lower(?),' ','') "
             "GROUP BY k.id ORDER BY k.nimi",
-            (f"%{query}%", query, query),
+            (contains_pattern(query), query, query),
         ).fetchall()
     return [{"id": r["id"], "name": r["nimi"], "vat_id": r["alvtunnus"]} for r in rows]
 

@@ -75,7 +75,10 @@ TOOLS = {
             "voucher number until a human reviews and approves it in Kitsas; this tool can never "
             "book money on its own. Expense lines are debited; the total is credited to the bank "
             "account unless credit_account says otherwise. Call suggest_account first so the "
-            "supplier keeps landing on the same account it always has."
+            "supplier keeps landing on the same account it always has. A supplier name that "
+            "identifies a partner already in the book, the same match suggest_account makes, "
+            "reuses that partner and says so in the summary; only a name that matches no "
+            "partner creates one."
         ),
         "schema": {
             "supplier_name": {"type": "string"},

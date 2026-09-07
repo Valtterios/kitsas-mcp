@@ -8,7 +8,11 @@ never does either, and never touches a voucher that is already in the ledger.
 Nothing outside the voucher being created is ever rewritten. A partner may be
 created, and a blank business id filled in on a partner that has no ledger
 history yet, but an existing IBAN binding is never re-pointed and neither a
-business id nor an IBAN on an established partner is ever overwritten. An IBAN
+business id nor an IBAN on an established partner is ever overwritten. A
+supplier name that already identifies a partner joins that partner rather than
+forking a second one beside it; the name is resolved by partners.py, the same
+rule suggest_account answers with, and a match on a name that is not the
+partner's own is named in the summary. An IBAN
 that belongs elsewhere is refused; a business id on an established partner is
 left alone and reported in the summary, because the voucher does not depend on
 it and refusing would block the ordinary path.
@@ -30,7 +34,6 @@ from .constants import (
 )
 from .dates import parse_iso_date
 from .errors import (
-    AmbiguousSupplierError,
     AmountError,
     ClosedFiscalYearError,
     KitsasError,
@@ -39,7 +42,15 @@ from .errors import (
     UnbalancedVoucherError,
 )
 from .money import cents_to_euros, euros_to_cents
+from .partners import resolve_partner
 from .read import fiscal_year_for
+
+# add_purchase_invoice takes a supplier name and no partner id, so the way out
+# of an ambiguity here is a name the book matches only once.
+AMBIGUITY_REMEDY = (
+    "Use a name that matches exactly one of them, or merge them in Kitsas; "
+    "find_supplier lists them."
+)
 
 # An invoice scan is a few hundred kilobytes. Anything past this is a wrong
 # path, and it would be copied into every future backup of the book forever.
@@ -140,22 +151,20 @@ def _normalise_iban(iban) -> str:
     return str(iban).replace(" ", "").replace("\xa0", "").upper()
 
 
-def _find_supplier_id(conn, name: str) -> int | None:
-    """Resolve a partner by name, refusing to choose between real alternatives."""
-    rows = conn.execute(
-        "SELECT id, nimi FROM Kumppani WHERE lower(trim(nimi)) = lower(?) ORDER BY id",
-        (name,),
-    ).fetchall()
-    if not rows:
-        return None
-    if len(rows) > 1:
-        names = ", ".join(f"{r['nimi']!r} (id {r['id']})" for r in rows)
-        raise AmbiguousSupplierError(
-            f"{name!r} matches {len(rows)} partners in this book that differ only by "
-            f"case or spacing: {names}. Merge or rename them in Kitsas, or pass a name "
-            "that matches exactly one of them."
-        )
-    return rows[0]["id"]
+def _matched_partner_note(typed: str, matched_name: str) -> str:
+    """Say out loud which partner a name that was not the partner's own landed on.
+
+    Reusing the partner is right: it is the one suggest_account just showed the
+    history of, and creating a second one beside it would split the supplier in
+    the book. But the voucher is being attached to a partner spelled
+    differently from what was typed, and on someone's books that is worth
+    reading rather than guessing at.
+    """
+    return (
+        f"Booked to {matched_name}, the partner already in this book that {typed!r} "
+        "matched; no new partner was created. Pass the full name if you meant a "
+        "different supplier."
+    )
 
 
 def _bind_iban(conn, supplier_id: int, supplier_name: str, iban) -> None:
@@ -221,27 +230,41 @@ def _fill_blank_business_id(conn, supplier_id: int, name: str, business_id) -> s
     return None
 
 
-def _upsert_supplier(conn, name: str, business_id, iban) -> tuple[int, str | None]:
-    """Return the partner id, and a note for the summary if anything was skipped."""
-    note = None
-    supplier_id = _find_supplier_id(conn, name)
-    if supplier_id is None:
+def _upsert_supplier(conn, name: str, business_id, iban) -> tuple[int, str, list[str]]:
+    """Return the partner id, the name it is filed under, and notes for the summary.
+
+    The name is resolved by the rule in partners.py, the same one
+    suggest_account answered with a moment earlier, so a bill for a supplier
+    that is already in the book joins that partner instead of forking a second
+    one that carries none of its history. A name that matches nothing really is
+    a new supplier, and that partner is created here.
+    """
+    notes = []
+    match = resolve_partner(conn, name, remedy=AMBIGUITY_REMEDY)
+
+    if match is None:
         cursor = conn.execute(
             "INSERT INTO Kumppani (nimi, alvtunnus, json) VALUES (?,?,?)",
             (name, business_id, "{}"),
         )
-        supplier_id = cursor.lastrowid
-    elif business_id:
-        existing = conn.execute(
-            "SELECT coalesce(alvtunnus,'') AS alvtunnus FROM Kumppani WHERE id = ?",
-            (supplier_id,),
-        ).fetchone()
-        if existing["alvtunnus"] == "":
-            note = _fill_blank_business_id(conn, supplier_id, name, business_id)
+        supplier_id, filed_as = cursor.lastrowid, name
+    else:
+        supplier_id, filed_as = match.id, match.name
+        if not match.exact:
+            notes.append(_matched_partner_note(name, filed_as))
+        if business_id:
+            existing = conn.execute(
+                "SELECT coalesce(alvtunnus,'') AS alvtunnus FROM Kumppani WHERE id = ?",
+                (supplier_id,),
+            ).fetchone()
+            if existing["alvtunnus"] == "":
+                skipped = _fill_blank_business_id(conn, supplier_id, filed_as, business_id)
+                if skipped:
+                    notes.append(skipped)
 
     if iban:
-        _bind_iban(conn, supplier_id, name, iban)
-    return supplier_id, note
+        _bind_iban(conn, supplier_id, filed_as, iban)
+    return supplier_id, filed_as, notes
 
 
 def _attach(conn, voucher_id: int, attachment: tuple) -> dict:
@@ -331,7 +354,9 @@ def add_purchase_invoice(
     title = description or supplier_name
 
     with book.connect_write() as conn:
-        supplier_id, business_id_note = _upsert_supplier(conn, supplier_name, business_id, iban)
+        supplier_id, filed_as, supplier_notes = _upsert_supplier(
+            conn, supplier_name, business_id, iban
+        )
 
         cursor = conn.execute(
             TOSITE_INSERT,
@@ -383,6 +408,10 @@ def add_purchase_invoice(
                     {
                         "source": "kitsas-mcp",
                         "supplier": supplier_name,
+                        # Both names, because they differ when the typed one
+                        # matched a partner already in the book.
+                        "partner": filed_as,
+                        "partner_id": supplier_id,
                         "booking_date": booking_date,
                         "lines": [
                             {"account": a, "cents": c, "description": d} for a, c, d in prepared
@@ -395,6 +424,10 @@ def add_purchase_invoice(
 
     return {
         "voucher_id": voucher_id,
+        # The partner the voucher is actually attached to, which is not always
+        # spelled the way the supplier name was typed.
+        "supplier": filed_as,
+        "supplier_id": supplier_id,
         "total": cents_to_euros(total),
         "credit_account": counter_account,
         "lines": [{"account": a, "amount": cents_to_euros(c)} for a, c, _ in prepared],
@@ -404,7 +437,7 @@ def add_purchase_invoice(
             f"Draft voucher {voucher_id} for {supplier_name}, {cents_to_euros(total)} euros on "
             f"{booking_date}, credited to account {counter_account}. It is not in the ledger; "
             "open Kitsas to check and approve it."
-            + (f" {business_id_note}" if business_id_note else "")
+            + "".join(f" {note}" for note in supplier_notes)
         ),
     }
 

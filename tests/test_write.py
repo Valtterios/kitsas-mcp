@@ -369,6 +369,84 @@ def test_two_partners_differing_only_by_case_are_refused(book, book_path):
     assert "Hetzner" in message and "HETZNER" in message
 
 
+def _rename_hetzner(book_path, name):
+    """Partner 7 carries the ledger history suggest_account learns from."""
+    conn = sqlite3.connect(book_path)
+    conn.execute("UPDATE Kumppani SET nimi = ? WHERE id = 7", (name,))
+    conn.commit()
+    conn.close()
+
+
+def test_a_shortened_name_joins_the_partner_already_in_the_book(book, book_path):
+    """The bug this replaced: 'Hetzner' created a second partner beside the real one.
+
+    suggest_account resolves 'Hetzner' to partner 7 and shows its history, so
+    add_purchase_invoice must attach the voucher to partner 7 as well. A new
+    partner here would carry none of that history, and no later suggest_account
+    would ever aggregate the two.
+    """
+    _rename_hetzner(book_path, "Hetzner Online GmbH")
+
+    result = add_purchase_invoice(book, **{**BILL, "supplier_name": "Hetzner"})
+
+    with book.connect_read() as conn:
+        names = [r["nimi"] for r in conn.execute("SELECT nimi FROM Kumppani ORDER BY id")]
+        used = conn.execute(
+            "SELECT kumppani FROM Tosite WHERE id = ?", (result["voucher_id"],)
+        ).fetchone()["kumppani"]
+    assert names == ["Verohallinto", "Hetzner Online GmbH"], "the supplier must not split in two"
+    assert used == 7
+    assert result["supplier"] == "Hetzner Online GmbH"
+    assert result["supplier_id"] == 7
+
+
+def test_a_match_on_a_name_that_is_not_the_partners_own_is_named_in_the_summary(book, book_path):
+    """Reusing the partner is right, but attaching to a different spelling is visible."""
+    _rename_hetzner(book_path, "Hetzner Online GmbH")
+
+    summary = add_purchase_invoice(book, **{**BILL, "supplier_name": "Hetzner"})["summary"]
+    assert "Hetzner Online GmbH" in summary
+    assert "no new partner was created" in summary
+    assert "Pass the full name if you meant a different supplier" in summary
+
+
+def test_the_summary_says_nothing_when_the_name_was_the_partners_own(book):
+    """An exact match is what the caller asked for and needs no remark."""
+    summary = add_purchase_invoice(book, **{**BILL, "supplier_name": "Hetzner"})["summary"]
+    assert "no new partner was created" not in summary
+
+
+def test_a_name_that_matches_no_partner_still_creates_one(book):
+    """Creating the partner is correct for a genuinely new supplier."""
+    result = add_purchase_invoice(book, **BILL)
+    with book.connect_read() as conn:
+        row = conn.execute(
+            "SELECT id, nimi FROM Kumppani WHERE nimi = 'Telia Finland Oyj'"
+        ).fetchone()
+    assert row is not None
+    assert result["supplier_id"] == row["id"]
+    assert "no new partner was created" not in result["summary"]
+
+
+def test_a_shortened_name_matching_two_partners_is_refused_and_writes_nothing(book, book_path):
+    """Which of two real suppliers a bill belongs to is the bookkeeper's call."""
+    _rename_hetzner(book_path, "Hetzner Online GmbH")
+    conn = sqlite3.connect(book_path)
+    conn.execute("INSERT INTO Kumppani (nimi, json) VALUES ('Hetzner Cloud', '{}')")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(AmbiguousSupplierError) as excinfo:
+        add_purchase_invoice(book, **{**BILL, "supplier_name": "Hetzner"})
+    message = str(excinfo.value)
+    assert "Hetzner Online GmbH" in message and "Hetzner Cloud" in message
+    assert "merge them in Kitsas" in message
+
+    with book.connect_read() as conn:
+        assert conn.execute("SELECT count(*) FROM Kumppani").fetchone()[0] == 3
+        assert conn.execute("SELECT count(*) FROM Tosite").fetchone()[0] == 4
+
+
 # -- Finding 3: the attachment size is capped --------------------------------
 
 

@@ -110,3 +110,38 @@ def test_get_voucher_names_the_supplier_rather_than_repeating_its_id(book):
     voucher = get_voucher(book, 1)
     assert voucher["supplier"] == "Hetzner"
     assert voucher["supplier_id"] == 7
+
+
+# -- LIKE metacharacters in the caller's query are literal text ---------------
+
+
+def _add_partner(book_path, name):
+    import sqlite3
+
+    conn = sqlite3.connect(book_path)
+    conn.execute("INSERT INTO Kumppani (nimi, json) VALUES (?, '{}')", (name,))
+    conn.commit()
+    conn.close()
+
+
+def test_find_supplier_treats_a_percent_as_a_literal_percent(book, book_path):
+    """Unescaped, '%' was a wildcard and listed every partner in the book."""
+    _add_partner(book_path, "Alennus 50% Oy")
+
+    assert [p["name"] for p in find_supplier(book, "%")] == ["Alennus 50% Oy"]
+    assert [p["name"] for p in find_supplier(book, "50%")] == ["Alennus 50% Oy"]
+
+
+def test_find_supplier_treats_an_underscore_as_a_literal_underscore(book, book_path):
+    """Unescaped, '_' matched any single character, so '_e_zner' found 'Hetzner'."""
+    _add_partner(book_path, "Nordic_IT Oy")
+
+    assert find_supplier(book, "_e_zner") == []
+    assert [p["name"] for p in find_supplier(book, "_")] == ["Nordic_IT Oy"]
+
+
+def test_find_supplier_still_matches_a_name_containing_a_backslash(book, book_path):
+    """The escape character is itself escaped, so it stays ordinary text."""
+    _add_partner(book_path, "A\\B Oy")
+
+    assert [p["name"] for p in find_supplier(book, "A\\B")] == ["A\\B Oy"]
