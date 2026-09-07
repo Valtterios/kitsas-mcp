@@ -117,12 +117,18 @@ def test_attaches_the_pdf(book, tmp_path):
     assert len(sha) == 64
 
 
-def test_refuses_an_attachment_that_is_not_there(book, tmp_path):
+def test_refuses_an_attachment_that_is_not_there(book, book_path, tmp_path):
     with pytest.raises(KitsasError) as excinfo:
         add_purchase_invoice(book, **{**BILL, "pdf_path": str(tmp_path / "missing.pdf")})
     assert "missing.pdf" in str(excinfo.value)
     with book.connect_read() as conn:
         assert conn.execute("SELECT count(*) FROM Tosite").fetchone()[0] == 4
+    # The row count alone would also be satisfied by a rollback. No backup file
+    # at all is what proves the attachment was read before the transaction was
+    # ever opened, which is the point of reading it there.
+    assert list(book_path.parent.glob("*.bak")) == [], (
+        "a bad attachment path must cost nothing: no transaction, so no backup"
+    )
 
 
 def test_takes_a_backup_before_the_first_write(book, book_path):
@@ -321,11 +327,34 @@ def test_refuses_to_move_an_iban_that_belongs_to_another_partner(book):
 # -- Finding 2: partner matching does not choose silently --------------------
 
 
-def test_a_supplier_name_with_stray_whitespace_reuses_the_existing_partner(book):
-    add_purchase_invoice(book, **{**BILL, "supplier_name": "  Hetzner  "})
+def test_a_supplier_name_with_stray_whitespace_reuses_the_existing_partner(book, book_path):
+    """The whitespace that matters is the whitespace already in the book.
+
+    add_purchase_invoice strips the incoming name itself, so an untidy argument
+    proves nothing about the trim() in the lookup SQL. A partner whose STORED
+    name carries a trailing space does: without trim() on the column, it is
+    never found and a second 'Verkkokauppa' partner is created beside it.
+    """
+    conn = sqlite3.connect(book_path)
+    cursor = conn.execute("INSERT INTO Kumppani (nimi, json) VALUES ('Verkkokauppa ', '{}')")
+    seeded_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+
+    add_purchase_invoice(book, **{**BILL, "supplier_name": "  Verkkokauppa  "})
+
     with book.connect_read() as conn:
-        rows = conn.execute("SELECT id FROM Kumppani WHERE trim(nimi) = 'Hetzner'").fetchall()
-    assert len(rows) == 1, "trailing whitespace must not create a second partner"
+        rows = conn.execute(
+            "SELECT id FROM Kumppani WHERE trim(nimi) = 'Verkkokauppa'"
+        ).fetchall()
+        used = conn.execute(
+            "SELECT kumppani FROM Tosite WHERE otsikko = ? ORDER BY id DESC LIMIT 1",
+            (BILL["description"],),
+        ).fetchone()["kumppani"]
+    assert [r["id"] for r in rows] == [seeded_id], (
+        "a stored name with trailing whitespace must be matched, not duplicated"
+    )
+    assert used == seeded_id, "the voucher must point at the partner already in the book"
 
 
 def test_two_partners_differing_only_by_case_are_refused(book, book_path):
@@ -479,3 +508,97 @@ def test_the_update_statement_alone_cannot_touch_a_ledger_voucher(book, monkeypa
 
     delete_draft(book, 1)
     assert get_voucher(book, 1)["state"] == 100, "the UPDATE must carry its own tila predicate"
+
+
+# -- Finding 5: the header columns are mapped in the order they are declared --
+
+
+def test_the_invoice_date_due_date_and_reference_land_in_their_own_columns(book):
+    """Pin TOSITE_INSERT's positional mapping to laskupvm, erapvm and viite.
+
+    Nothing else reads any of the three back, so swapping two of them in the
+    statement is invisible: a due date would sit in the varchar reference
+    column and the reference in a date column, and every other test would
+    still pass. The three values are deliberately distinct.
+    """
+    result = add_purchase_invoice(
+        book,
+        **{
+            **BILL,
+            "invoice_date": "2026-04-28",
+            "due_date": "2026-05-12",
+            "reference": "1234561",
+        },
+    )
+    voucher = get_voucher(book, result["voucher_id"])
+    assert voucher["invoice_date"] == "2026-04-28"
+    assert voucher["due_date"] == "2026-05-12"
+    assert voucher["reference"] == "1234561"
+
+    # Read straight from the columns as well, so the assertion does not depend
+    # on get_voucher's own mapping being right either.
+    with book.connect_read() as conn:
+        row = conn.execute(
+            "SELECT laskupvm, erapvm, viite FROM Tosite WHERE id = ?", (result["voucher_id"],)
+        ).fetchone()
+    assert (row["laskupvm"], row["erapvm"], row["viite"]) == ("2026-04-28", "2026-05-12", "1234561")
+
+
+# -- Finding 6: the business id is written into pre-existing data with care ---
+
+
+def test_a_new_partner_gets_the_business_id(book):
+    add_purchase_invoice(book, **{**BILL, "business_id": "1234567-8"})
+    with book.connect_read() as conn:
+        row = conn.execute(
+            "SELECT alvtunnus FROM Kumppani WHERE nimi = 'Telia Finland Oyj'"
+        ).fetchone()
+    assert row["alvtunnus"] == "1234567-8"
+
+
+def test_a_blank_business_id_is_filled_in_on_a_partner_with_no_ledger_history(book, book_path):
+    conn = sqlite3.connect(book_path)
+    cursor = conn.execute("INSERT INTO Kumppani (nimi, json) VALUES ('Verkkokauppa', '{}')")
+    seeded_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+
+    add_purchase_invoice(book, **{**BILL, "supplier_name": "Verkkokauppa", "business_id": "1234567-8"})
+
+    with book.connect_read() as conn:
+        row = conn.execute("SELECT alvtunnus FROM Kumppani WHERE id = ?", (seeded_id,)).fetchone()
+    assert row["alvtunnus"] == "1234567-8"
+
+
+def test_a_different_business_id_already_on_file_is_left_untouched(book):
+    """Verohallinto is seeded with FI02454583. A misread invoice must not move it."""
+    add_purchase_invoice(
+        book, **{**BILL, "supplier_name": "Verohallinto", "business_id": "9999999-9"}
+    )
+    with book.connect_read() as conn:
+        row = conn.execute(
+            "SELECT alvtunnus FROM Kumppani WHERE nimi = 'Verohallinto'"
+        ).fetchone()
+    assert row["alvtunnus"] == "FI02454583", "an existing business id is pre-existing book data"
+
+
+def test_refuses_to_write_a_business_id_onto_a_partner_with_ledger_history(book):
+    """Hetzner has two ledger vouchers and no business id. This is not the place to add one."""
+    with pytest.raises(KitsasError) as excinfo:
+        add_purchase_invoice(book, **{**BILL, "supplier_name": "Hetzner", "business_id": "1234567-8"})
+    message = str(excinfo.value)
+    assert "Hetzner" in message
+    assert "1234567-8" in message
+    assert "Kitsas" in message
+
+    with book.connect_read() as conn:
+        row = conn.execute("SELECT alvtunnus FROM Kumppani WHERE id = 7").fetchone()
+        vouchers = conn.execute("SELECT count(*) FROM Tosite").fetchone()[0]
+    assert (row["alvtunnus"] or "") == ""
+    assert vouchers == 4, "the refusal must roll the whole transaction back"
+
+
+def test_a_partner_with_ledger_history_takes_an_invoice_without_a_business_id(book):
+    """The refusal is about the business id only, not about invoicing an old supplier."""
+    result = add_purchase_invoice(book, **{**BILL, "supplier_name": "Hetzner"})
+    assert get_voucher(book, result["voucher_id"])["supplier"] == "Hetzner"

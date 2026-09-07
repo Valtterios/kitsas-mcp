@@ -123,3 +123,34 @@ def test_fuzzy_match_on_ambiguous_substring_raises(book, book_path):
     assert "Hetzner Extra Services" in error_msg
     assert "Hetzner Cloud" in error_msg
     assert "find_supplier lists them" in error_msg
+
+
+def test_exact_name_match_on_two_partners_differing_only_by_case_raises(book, book_path):
+    """'Hetzner' and 'HETZNER' are two partners; neither one's history may be assumed."""
+    conn = sqlite3.connect(book_path)
+    conn.execute("INSERT INTO Kumppani (id, nimi, json) VALUES (99, 'HETZNER', '{}')")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(AmbiguousSupplierError) as exc_info:
+        suggest_account(book, "Hetzner")
+    message = str(exc_info.value)
+    assert "matches 2 partners" in message
+    assert "Hetzner (id 7)" in message
+    assert "HETZNER (id 99)" in message
+    assert "Pass the partner id instead" in message
+
+
+def test_a_partner_id_sent_as_a_digit_string_is_read_as_an_id(book):
+    """The error message tells the caller to pass the id; JSON may send it as a string."""
+    assert suggest_account(book, "7") == suggest_account(book, 7)
+    assert suggest_account(book, "7")[0]["account"] == 4590
+
+
+def test_a_partner_id_as_an_integer_still_works(book):
+    assert suggest_account(book, 7)[0]["account"] == 4590
+
+
+def test_a_name_is_still_treated_as_a_name(book):
+    assert suggest_account(book, "Hetzner")[0]["account"] == 4590
+    assert suggest_account(book, "Telia") == []

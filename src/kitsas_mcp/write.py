@@ -6,8 +6,10 @@ into the ledger and allocates its number when a human approves it. This server
 never does either, and never touches a voucher that is already in the ledger.
 
 Nothing outside the voucher being created is ever rewritten. A partner may be
-created, and a blank business id filled in, but an existing IBAN binding is
-never re-pointed: this module refuses instead.
+created, and a blank business id filled in on a partner that has no ledger
+history yet, but an existing IBAN binding is never re-pointed and neither a
+business id nor an IBAN on an established partner is ever overwritten: this
+module refuses instead.
 """
 
 import hashlib
@@ -182,6 +184,35 @@ def _bind_iban(conn, supplier_id: int, supplier_name: str, iban) -> None:
     )
 
 
+def _fill_blank_business_id(conn, supplier_id: int, name: str, business_id) -> None:
+    """Fill in a missing business id, but never on an established partner.
+
+    A partner that already carries ledger vouchers is pre-existing book data:
+    its business id belongs on the invoices and reports those vouchers are
+    part of, and a business id read off a scanned invoice is only as good as
+    the scan. Writing one here would be undoable except by restoring a backup,
+    so this refuses and leaves the correction to Kitsas. A partner created by
+    this same call has no history to contradict, and is filled in freely.
+
+    A partner that already has a non-blank alvtunnus is never touched at all,
+    whatever its history: the WHERE clause carries that condition itself.
+    """
+    booked = conn.execute(
+        "SELECT count(*) FROM Tosite WHERE kumppani = ? AND tila >= ?",
+        (supplier_id, TILA_KIRJANPIDOSSA),
+    ).fetchone()[0]
+    if booked:
+        raise KitsasError(
+            f"{name!r} already has {booked} voucher(s) in the ledger and no business id "
+            f"on file, so this will not write {business_id!r} onto it. Set the business id "
+            "on the partner in Kitsas, or leave business_id out of this call."
+        )
+    conn.execute(
+        "UPDATE Kumppani SET alvtunnus = ? WHERE id = ? AND coalesce(alvtunnus,'') = ''",
+        (business_id, supplier_id),
+    )
+
+
 def _upsert_supplier(conn, name: str, business_id, iban) -> int:
     supplier_id = _find_supplier_id(conn, name)
     if supplier_id is None:
@@ -191,10 +222,12 @@ def _upsert_supplier(conn, name: str, business_id, iban) -> int:
         )
         supplier_id = cursor.lastrowid
     elif business_id:
-        conn.execute(
-            "UPDATE Kumppani SET alvtunnus = ? WHERE id = ? AND coalesce(alvtunnus,'') = ''",
-            (business_id, supplier_id),
-        )
+        existing = conn.execute(
+            "SELECT coalesce(alvtunnus,'') AS alvtunnus FROM Kumppani WHERE id = ?",
+            (supplier_id,),
+        ).fetchone()
+        if existing["alvtunnus"] == "":
+            _fill_blank_business_id(conn, supplier_id, name, business_id)
 
     if iban:
         _bind_iban(conn, supplier_id, name, iban)

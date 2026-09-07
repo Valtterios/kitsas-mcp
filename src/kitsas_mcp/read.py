@@ -100,8 +100,11 @@ def list_vouchers(book, date_from, date_to, supplier=None, account=None, state=N
 
 def get_voucher(book, voucher_id: int):
     with book.connect_read() as conn:
+        # The alias must not be "kumppani": t.* already brings a column of that
+        # name (the partner id), and sqlite3.Row resolves a duplicated name to
+        # the first of the two, so the partner's name would never be returned.
         header = conn.execute(
-            "SELECT t.*, k.nimi AS kumppani FROM Tosite t "
+            "SELECT t.*, k.nimi AS kumppani_nimi FROM Tosite t "
             "LEFT JOIN Kumppani k ON k.id = t.kumppani WHERE t.id = ?",
             (voucher_id,),
         ).fetchone()
@@ -126,7 +129,8 @@ def get_voucher(book, voucher_id: int):
         "state": header["tila"],
         "number": header["tunniste"],
         "title": header["otsikko"],
-        "supplier": header["kumppani"],
+        "supplier": header["kumppani_nimi"],
+        "supplier_id": header["kumppani"],
         "invoice_date": header["laskupvm"],
         "due_date": header["erapvm"],
         "reference": header["viite"],

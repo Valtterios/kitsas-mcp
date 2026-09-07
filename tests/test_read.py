@@ -103,3 +103,10 @@ def test_get_voucher_returns_header_and_entries(book):
 
 def test_get_voucher_returns_none_for_a_missing_id(book):
     assert get_voucher(book, 4242) is None
+
+
+def test_get_voucher_names_the_supplier_rather_than_repeating_its_id(book):
+    """Tosite.kumppani is the id; the joined Kumppani.nimi must not be shadowed by it."""
+    voucher = get_voucher(book, 1)
+    assert voucher["supplier"] == "Hetzner"
+    assert voucher["supplier_id"] == 7
