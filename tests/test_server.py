@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 import pytest
 
@@ -99,4 +100,30 @@ def test_build_server_registers_all_ten_tools_with_a_schema(book_path):
         assert tool.description.strip(), f"{tool.name} has no description"
         assert tool.input_schema["type"] == "object"
 
-    assert server.get_request_handler("tools/call") is not None, "no tools/call handler was registered"
+
+def test_build_server_tools_call_handler_actually_runs_a_tool(book_path):
+    # test_build_server_registers_all_ten_tools_with_a_schema only checks
+    # that a tools/call handler is registered, not that invoking it behaves
+    # correctly. A regression in on_call_tool's return shape (wrong
+    # CallToolResult field, a changed content type) would still pass that
+    # test and only show up when a real client called a tool, which is the
+    # same class of gap that hid the missing-decorator-API defect. This
+    # drives the real handler, the one mcp itself calls on "tools/call", for
+    # both a successful and a failing invocation.
+    from mcp.types import CallToolRequestParams
+
+    server = build_server(book_path)
+    call_tool_entry = server.get_request_handler("tools/call")
+    assert call_tool_entry is not None, "no tools/call handler was registered"
+
+    ok_params = CallToolRequestParams(name="list_accounts", arguments={})
+    ok_result = asyncio.run(call_tool_entry.handler(None, ok_params))
+    assert ok_result.is_error is False
+    assert len(ok_result.content) == 1
+    accounts = json.loads(ok_result.content[0].text)
+    assert {"number": 1910, "name": "Pankkitili", "type": "ARP"} in accounts
+
+    bad_params = CallToolRequestParams(name="drop_everything", arguments={})
+    bad_result = asyncio.run(call_tool_entry.handler(None, bad_params))
+    payload = json.loads(bad_result.content[0].text)
+    assert "drop_everything" in payload["error"]

@@ -3,7 +3,7 @@ name = "kitsas-mcp"
 version = "0.1.0"
 description = "MCP server for local Kitsas bookkeeping files"
 requires-python = ">=3.11"
-dependencies = ["mcp>=1.2.0"]
+dependencies = ["mcp>=2.0.0"]
 
 [project.scripts]
 kitsas-mcp = "kitsas_mcp.server:main"
