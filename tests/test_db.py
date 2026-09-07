@@ -1,9 +1,17 @@
+import shutil
 import sqlite3
+from pathlib import Path
 
 import pytest
 
 from kitsas_mcp.db import Book
-from kitsas_mcp.errors import BookLockedError, NotAKitsasBookError, UnsupportedSchemaError
+from kitsas_mcp.errors import (
+    BackupError,
+    BookLockedError,
+    CorruptBookError,
+    NotAKitsasBookError,
+    UnsupportedSchemaError,
+)
 
 
 def test_opens_a_kitsas_book(book):
@@ -64,3 +72,52 @@ def test_backup_copies_the_book_once_per_session(book, book_path):
     assert first.exists()
     assert first.stat().st_size == book_path.stat().st_size
     assert book.backup() == first, "a second backup in the same session reuses the first"
+
+
+def test_backup_failure_blocks_the_write_and_leaves_the_book_untouched(book, book_path, monkeypatch):
+    original = book_path.read_bytes()
+
+    def boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(shutil, "copy2", boom)
+
+    with pytest.raises(BackupError):
+        with book.connect_write():
+            pass
+
+    assert book_path.read_bytes() == original
+
+
+def test_reports_a_damaged_book(book_path):
+    size = book_path.stat().st_size
+    data = book_path.read_bytes()
+    book_path.write_bytes(data[: size // 2])
+
+    with pytest.raises(CorruptBookError) as excinfo:
+        Book(book_path).kpversio
+    assert "damaged" in str(excinfo.value)
+
+
+def test_backup_copies_wal_sidecar_files(book_path):
+    wal = Path(str(book_path) + "-wal")
+    shm = Path(str(book_path) + "-shm")
+
+    # Open a second connection and write without checkpointing, so the
+    # -wal sidecar has real, uncheckpointed content at backup time, the
+    # way a real Kitsas book does while it is in use.
+    conn = sqlite3.connect(book_path, isolation_level=None)
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("INSERT INTO Asetus (avain, arvo) VALUES ('extra', '1')")
+        assert wal.exists() and wal.stat().st_size > 0
+
+        backup_target = Book(book_path).backup()
+
+        backup_wal = Path(str(backup_target) + "-wal")
+        assert backup_wal.exists()
+        assert backup_wal.stat().st_size == wal.stat().st_size
+        if shm.exists():
+            assert Path(str(backup_target) + "-shm").exists()
+    finally:
+        conn.close()

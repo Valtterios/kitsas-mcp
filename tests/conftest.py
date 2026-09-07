@@ -25,6 +25,8 @@ FISCAL_YEARS = [
 
 def _build(path: Path) -> None:
     conn = sqlite3.connect(path)
+    # Real Kitsas books run in WAL mode, so the synthetic book should too.
+    conn.execute("PRAGMA journal_mode = WAL")
     conn.executescript((FIXTURES / "luo.sql").read_text(encoding="utf-8"))
 
     conn.execute("INSERT INTO Asetus (avain, arvo) VALUES ('KpVersio', '24')")

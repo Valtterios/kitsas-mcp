@@ -17,6 +17,14 @@ class UnsupportedSchemaError(KitsasError):
     pass
 
 
+class BackupError(KitsasError):
+    pass
+
+
+class CorruptBookError(KitsasError):
+    pass
+
+
 class NoFiscalYearError(KitsasError):
     pass
 
