@@ -7,18 +7,18 @@ from .constants import TILA_KIRJANPIDOSSA
 from .dates import parse_iso_date
 from .errors import LedgerVoucherError, NoFiscalYearError
 from .money import cents_to_euros
-from .partners import ESCAPE_CLAUSE, contains_pattern
+from .partners import ESCAPE_CLAUSE, contains_pattern, folded
 
-# Sentinel for list_fiscal_years' "confirmed" field when Tilikausi.json could
-# not be read as an object: whether the year is confirmed is then genuinely
-# unknown, not "no". A missing or unreadable confirmation date must never
-# read as unconfirmed, because that is exactly the field that stops a write
-# into a closed year (see _check_fiscal_year in write.py); reporting None
-# here would silently reopen a fiscal year that might really be closed. The
-# sentinel is truthy, so a caller that only tests `if year["confirmed"]`
-# still refuses the write, and it is distinguishable from a real date so
-# _check_fiscal_year can raise a message that names the actual cause.
-FISCAL_YEAR_CONFIRMED_UNKNOWN = "unknown (unreadable fiscal year data)"
+# Every fiscal year carries "confirmed_unknown" beside "confirmed": true when
+# Tilikausi.json could not be read as an object, so whether the year is
+# confirmed is genuinely unknown rather than "no". An unreadable confirmation
+# date must never read as unconfirmed, because that is exactly the field that
+# stops a write into a closed year (see _check_fiscal_year in write.py):
+# "confirmed": null on its own would silently reopen a fiscal year that might
+# really be closed. It is a separate boolean rather than a word in
+# "confirmed" so that "confirmed" stays what it says it is, an ISO date or
+# null, for a client that compares it against other dates.
+CONFIRMED_UNKNOWN_KEY = "confirmed_unknown"
 
 
 def no_such_voucher_error(voucher_id: int) -> LedgerVoucherError:
@@ -38,15 +38,13 @@ def list_fiscal_years(book) -> list[dict]:
             data = json.loads(row["json"] or "{}")
         except json.JSONDecodeError:
             data = None
-        if isinstance(data, dict):
-            confirmed = data.get("vahvistettu")
-        else:
-            confirmed = FISCAL_YEAR_CONFIRMED_UNKNOWN
+        unknown = not isinstance(data, dict)
         years.append(
             {
                 "starts": row["alkaa"],
                 "ends": row["loppuu"],
-                "confirmed": confirmed,
+                "confirmed": None if unknown else data.get("vahvistettu"),
+                CONFIRMED_UNKNOWN_KEY: unknown,
                 "current": row["alkaa"] <= today <= row["loppuu"],
             }
         )
@@ -63,24 +61,40 @@ def fiscal_year_for(book, when: str) -> dict:
     )
 
 
+# Built once, and outside the f-string in find_supplier: nesting the same
+# quote character inside an f-string expression only became legal in Python
+# 3.12, and this package supports 3.11.
+_NAME = folded("k.nimi")
+_BUSINESS_ID = folded("coalesce(k.alvtunnus,'')")
+_IBAN = folded("coalesce(i.iban,'')")
+_TYPED = folded()
+FIND_SUPPLIER_SQL = (
+    "SELECT k.id, k.nimi, k.alvtunnus FROM Kumppani k "
+    "LEFT JOIN KumppaniIban i ON i.kumppani = k.id "
+    f"WHERE {_NAME} LIKE {_TYPED} {ESCAPE_CLAUSE} "
+    f"OR {_BUSINESS_ID} = {_TYPED} "
+    f"OR replace({_IBAN},' ','') = replace({_TYPED},' ','') "
+    "GROUP BY k.id ORDER BY k.nimi"
+)
+
+
 def find_supplier(book, query: str) -> list[dict]:
     """Every partner whose name contains the query, or whose business id or IBAN is it.
 
     A browsing tool: it returns a list, and finding several partners is a
     result, not an error. The name matching is the same rule partners.py
     resolves a single supplier with, so what this lists and what
-    suggest_account and add_purchase_invoice pick are never at odds.
+    suggest_account and add_purchase_invoice pick are never at odds. That
+    includes the trim: partners.resolve_partner strips the caller's text
+    before matching, so without the strip here find_supplier("  Hetzner  ")
+    found nothing where the other two resolved the partner, and the one
+    tool a bookkeeper reaches for to check the other two disagreed with
+    them. Both sides are case-folded by casefold(), not by SQLite's
+    ASCII-only lower(); see partners.py.
     """
+    query = str(query).strip()
     with book.connect_read() as conn:
-        rows = conn.execute(
-            "SELECT k.id, k.nimi, k.alvtunnus FROM Kumppani k "
-            "LEFT JOIN KumppaniIban i ON i.kumppani = k.id "
-            f"WHERE lower(trim(k.nimi)) LIKE lower(?) {ESCAPE_CLAUSE} "
-            "OR lower(coalesce(k.alvtunnus,'')) = lower(?) "
-            "OR replace(lower(coalesce(i.iban,'')),' ','') = replace(lower(?),' ','') "
-            "GROUP BY k.id ORDER BY k.nimi",
-            (contains_pattern(query), query, query),
-        ).fetchall()
+        rows = conn.execute(FIND_SUPPLIER_SQL, (contains_pattern(query), query, query)).fetchall()
     return [{"id": r["id"], "name": r["nimi"], "vat_id": r["alvtunnus"]} for r in rows]
 
 

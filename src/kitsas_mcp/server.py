@@ -18,7 +18,13 @@ TOOLS = {
         "handler": lambda book, args: accounts.list_accounts(book, args.get("search")),
     },
     "list_fiscal_years": {
-        "description": "List fiscal years, showing which is current and which have been confirmed. Nothing can be written into a confirmed year.",
+        "description": (
+            "List fiscal years, showing which is current and which have been confirmed. "
+            "Nothing can be written into a confirmed year. 'confirmed' is the confirmation "
+            "date or null; 'confirmed_unknown' is true when the year's stored data could "
+            "not be read, and a year like that is closed to writes too, because whether it "
+            "was confirmed cannot be told."
+        ),
         "schema": {},
         "required": [],
         "handler": lambda book, args: read.list_fiscal_years(book),
@@ -78,7 +84,9 @@ TOOLS = {
             "supplier keeps landing on the same account it always has. A supplier name that "
             "identifies a partner already in the book, the same match suggest_account makes, "
             "reuses that partner and says so in the summary; only a name that matches no "
-            "partner creates one."
+            "partner creates one. A partner matched that way, by a substring of its name "
+            "rather than by its own name, gets the voucher but keeps its own business id "
+            "and IBAN: use partner_id when you mean a partner outright."
         ),
         "schema": {
             "supplier_name": {"type": "string"},
@@ -89,6 +97,18 @@ TOOLS = {
             "booking_date": {"type": "string", "description": "YYYY-MM-DD, must be in an open fiscal year"},
             "business_id": {"type": "string"},
             "iban": {"type": "string"},
+            "partner_id": {
+                "type": "integer",
+                "description": (
+                    "Use the partner with this id and do not match by name at all. "
+                    "For when the name rule picks the wrong partner: a supplier whose "
+                    "name is contained in another partner's name always matches that "
+                    "partner, however fully it is spelled. Get the id from "
+                    "find_supplier. The partner must exist. supplier_name is still "
+                    "required and is then only the text written on the voucher; "
+                    "partner_id decides which partner the voucher belongs to."
+                ),
+            },
             "invoice_date": {"type": "string", "description": "YYYY-MM-DD"},
             "due_date": {"type": "string", "description": "YYYY-MM-DD"},
             "reference": {"type": "string"},
@@ -183,14 +203,22 @@ def call_tool(book_path, name, args):
         return spec["handler"](Book(book_path), args)
     except KitsasError as exc:
         return {"error": str(exc)}
-    except (KeyError, TypeError) as exc:
-        # Arguments were already checked above against this tool's required
-        # list and its schema's argument names, so a KeyError or TypeError
-        # reaching here did not come from a missing or unexpected argument.
-        # It is a bug inside the handler, not something the caller did
-        # wrong, so it is labelled as an internal error rather than
-        # reported as a bad-arguments message that would send the caller
-        # back to double-check arguments that were actually correct.
+    except Exception as exc:
+        # Everything that is not a KitsasError. Arguments were already checked
+        # above against this tool's required list and its schema's argument
+        # names, so a KeyError or TypeError reaching here did not come from a
+        # missing or unexpected argument, and an OperationalError ("no such
+        # table", deliberately re-raised by db.connect_read rather than
+        # mistaken for a lock) or an InterfaceError (a dict where a string
+        # belonged) never comes from one either. All of them are bugs inside
+        # the handler rather than something the caller did wrong, so they are
+        # labelled as internal errors rather than reported as bad-arguments
+        # messages that would send the caller back to double-check arguments
+        # that were actually correct.
+        #
+        # Catching them at all is the point: an exception leaving here reaches
+        # the MCP transport, where the failure is reported without is_error
+        # set, which is the exact defect this shape exists to close.
         return {
             "error": (
                 f"Internal error in {name}: {exc!r}. This is a bug in the tool, "
@@ -233,11 +261,12 @@ def build_server(book_path):
 
     async def on_call_tool(ctx, params):
         result = call_tool(book_path, params.name, params.arguments or {})
-        # call_tool never raises: every failure it reports comes back as a
-        # dict with an "error" key instead. Leaving is_error at its default
-        # (False) would tell an MCP client that a refused write - a
-        # confirmed fiscal year, a locked book, an unknown account -
-        # completed successfully, because the failure is otherwise visible
+        # call_tool catches every Exception and returns it as a dict with an
+        # "error" key, so a failure always arrives here as that key rather
+        # than as an exception on its way to the transport. Leaving is_error
+        # at its default (False) would tell an MCP client that a refused
+        # write - a confirmed fiscal year, a locked book, an unknown account
+        # - completed successfully, because the failure is otherwise visible
         # only by inspecting the JSON payload for that key.
         is_error = isinstance(result, dict) and "error" in result
         return CallToolResult(

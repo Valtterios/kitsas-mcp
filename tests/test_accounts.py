@@ -1,7 +1,12 @@
 import json
 import pytest
 
-from kitsas_mcp.accounts import default_bank_account, default_payable_account, get_account, list_accounts
+from kitsas_mcp.accounts import (
+    account_by_number,
+    default_bank_account_of,
+    default_payable_account_of,
+    list_accounts,
+)
 from kitsas_mcp.errors import AccountNotFoundError
 
 
@@ -24,22 +29,33 @@ def test_search_matches_the_account_number(book):
     assert [a["number"] for a in list_accounts(book, "4590")] == [4590]
 
 
-def test_get_account_returns_one(book):
-    assert get_account(book, 4000)["name"] == "Tavaraostot, varsinainen toiminta"
+def test_account_by_number_returns_one(book):
+    assert account_by_number(list_accounts(book), 4000)["name"] == "Tavaraostot, varsinainen toiminta"
 
 
-def test_get_account_names_the_missing_number(book):
+def test_account_by_number_names_the_missing_number(book):
     with pytest.raises(AccountNotFoundError) as excinfo:
-        get_account(book, 9999)
+        account_by_number(list_accounts(book), 9999)
     assert "9999" in str(excinfo.value)
 
 
 def test_default_bank_account_is_the_arp_account(book):
-    assert default_bank_account(book) == 1910
+    assert default_bank_account_of(list_accounts(book)) == 1910
 
 
 def test_default_payable_account_is_the_bo_account(book):
-    assert default_payable_account(book) == 2960
+    assert default_payable_account_of(list_accounts(book)) == 2960
+
+
+def test_a_finnish_account_name_is_searched_case_insensitively(book):
+    """The search folds case in Python, where ä folds; SQLite's lower() leaves it alone."""
+    with book.connect_write() as conn:
+        conn.execute(
+            "INSERT INTO Tili (numero, tyyppi, json) VALUES (?,?,?)",
+            (4700, "DZ", json.dumps({"nimi": {"fi": "Matkakulut, Ähtäri"}})),
+        )
+    assert [a["number"] for a in list_accounts(book, "ähtäri")] == [4700]
+    assert [a["number"] for a in list_accounts(book, "ÄHTÄRI")] == [4700]
 
 
 def test_list_accounts_with_malformed_json(book):
@@ -115,28 +131,28 @@ def test_number_search_exact_match(book):
 
 
 def test_default_bank_account_with_multiple_candidates(book):
-    """When multiple bank accounts exist, default_bank_account should raise."""
+    """When multiple bank accounts exist, the default must be refused, not guessed."""
     with book.connect_write() as conn:
         conn.execute(
             "INSERT INTO Tili (numero, tyyppi, json) VALUES (?,?,?)",
             (1911, "ARP", json.dumps({"nimi": {"fi": "Toinen pankkitili"}})),
         )
     with pytest.raises(AccountNotFoundError) as excinfo:
-        default_bank_account(book)
+        default_bank_account_of(list_accounts(book))
     error_msg = str(excinfo.value)
     assert "1910" in error_msg
     assert "1911" in error_msg
 
 
 def test_default_payable_account_with_multiple_candidates(book):
-    """When multiple payable accounts exist, default_payable_account should raise."""
+    """When multiple payable accounts exist, the default must be refused, not guessed."""
     with book.connect_write() as conn:
         conn.execute(
             "INSERT INTO Tili (numero, tyyppi, json) VALUES (?,?,?)",
             (2961, "BO", json.dumps({"nimi": {"fi": "Toiset ostovelat"}})),
         )
     with pytest.raises(AccountNotFoundError) as excinfo:
-        default_payable_account(book)
+        default_payable_account_of(list_accounts(book))
     error_msg = str(excinfo.value)
     assert "2960" in error_msg
     assert "2961" in error_msg

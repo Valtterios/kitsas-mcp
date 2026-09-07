@@ -106,7 +106,10 @@ def test_resolve_partner_carries_the_callers_remedy_into_the_error(book, book_pa
 def test_all_three_call_sites_land_on_the_same_partner(book, book_path, typed):
     rename_partner_7(book_path, "Hetzner Online GmbH")
 
-    assert [p["id"] for p in find_supplier(book, typed.strip())] == [7]
+    # No .strip() here: find_supplier used to be the one call site that did
+    # not trim the caller's text, so stripping it in the test hid the very
+    # disagreement this test exists to catch.
+    assert [p["id"] for p in find_supplier(book, typed)] == [7]
     assert suggest_account(book, typed)[0]["account"] == 4590
 
     result = add_purchase_invoice(book, **{**BILL, "supplier_name": typed})
@@ -139,3 +142,61 @@ def test_the_history_shown_belongs_to_the_partner_the_voucher_gets(book, book_pa
     assert suggest_account(book, partner)[0]["account"] == 4590, (
         "the voucher must be attached to the partner whose history was shown"
     )
+
+
+# -- a Finnish name folds on both sides -------------------------------------
+# SQLite's lower() and LIKE fold ASCII only: lower('KÄRKKÄINEN') comes back
+# unchanged and 'KÄRKKÄINEN' LIKE '%kärkkäinen%' is 0. A large share of real
+# Finnish supplier and member names carry ä, ö or å, so without a fold that
+# handles them the duplicate partner this module exists to prevent appeared
+# anyway, on exactly the names it matters most for.
+
+
+def test_an_exact_finnish_name_matches_whatever_its_case(book, book_path):
+    partner = add_partner(book_path, "Kärkkäinen Oy")
+    with book.connect_read() as conn:
+        match = resolve_partner(conn, "KÄRKKÄINEN OY", remedy="x")
+    assert (match.id, match.name, match.exact) == (partner, "Kärkkäinen Oy", True)
+
+
+def test_a_finnish_substring_matches_whatever_its_case(book, book_path):
+    partner = add_partner(book_path, "Osuuskunta Ähtärin Sähkö")
+    with book.connect_read() as conn:
+        match = resolve_partner(conn, "ähtärin SÄHKÖ", remedy="x")
+    assert match.id == partner
+    assert match.exact is False
+
+
+def test_find_supplier_finds_a_finnish_name_in_the_other_case(book, book_path):
+    partner = add_partner(book_path, "Kärkkäinen Oy")
+    assert [p["id"] for p in find_supplier(book, "KÄRKKÄINEN")] == [partner]
+
+
+def test_a_finnish_supplier_name_does_not_fork_the_partner(book, book_path):
+    """The whole point: 'KÄRKKÄINEN OY' shouted must be the partner already there."""
+    partner = add_partner(book_path, "Kärkkäinen Oy")
+
+    result = add_purchase_invoice(book, **{**BILL, "supplier_name": "KÄRKKÄINEN OY"})
+
+    assert voucher_partner(book, result["voucher_id"]) == partner
+    assert partner_ids(book) == [1, 7, partner], "no second partner may appear beside it"
+    assert result["supplier"] == "Kärkkäinen Oy"
+
+
+def test_two_finnish_partners_differing_only_by_case_are_refused(book, book_path):
+    """Folding the names must make these two ambiguous, not silently pick one."""
+    add_partner(book_path, "Kärkkäinen Oy")
+    add_partner(book_path, "KÄRKKÄINEN OY")
+
+    with pytest.raises(AmbiguousSupplierError):
+        add_purchase_invoice(book, **{**BILL, "supplier_name": "kärkkäinen oy"})
+
+
+def test_a_finnish_name_still_reads_its_like_metacharacters_literally(book, book_path):
+    """The fold must not undo the LIKE escaping the pattern already carries."""
+    add_partner(book_path, "Ähtäri 50% Oy")
+    add_partner(book_path, "Ähtäri 50 prosenttia")
+
+    with book.connect_read() as conn:
+        match = resolve_partner(conn, "ähtäri 50%", remedy="x")
+    assert match.name == "Ähtäri 50% Oy", "the % must be a literal, not a wildcard"

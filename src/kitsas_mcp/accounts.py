@@ -31,50 +31,43 @@ def _row_to_account(row) -> dict:
     }
 
 
+def accounts_on(conn) -> list[dict]:
+    """The whole chart of accounts, on a connection the caller already has open.
+
+    One read, and every question below is then answered against the list it
+    returns. There used to be three spellings of "which account is this"
+    (by number, on a connection, over a loaded chart) and three of "which
+    account is the default of this type", differing only in where the rows
+    came from. Splitting the read from the two questions leaves one helper
+    per question, so an error message can only be written once.
+    """
+    return [_row_to_account(r) for r in conn.execute(f"{SELECT} ORDER BY numero")]
+
+
 def list_accounts(book, search=None) -> list[dict]:
     with book.connect_read() as conn:
-        accounts = [_row_to_account(r) for r in conn.execute(f"{SELECT} ORDER BY numero")]
+        accounts = accounts_on(conn)
     if search:
-        needle = str(search).lower()
-        accounts = [a for a in accounts if needle in a["name"].lower() or str(a["number"]).startswith(needle)]
+        # casefold, not lower: the account names in a Finnish book are
+        # Finnish, and this is the same fold the partner name matching uses.
+        needle = str(search).casefold()
+        accounts = [
+            a for a in accounts
+            if needle in a["name"].casefold() or str(a["number"]).startswith(needle)
+        ]
     return accounts
 
 
 def account_by_number(accounts: list[dict], number: int) -> dict:
-    """Find `number` in a chart of accounts already loaded, e.g. by list_accounts.
-
-    Same result, and the same error, as get_account, but without a query of
-    its own: for validating several account numbers against one chart read
-    once, such as add_purchase_invoice's expense lines.
-    """
+    """Which account is `number`, in a chart already read by accounts_on or list_accounts."""
     for account in accounts:
         if account["number"] == number:
             return account
     raise AccountNotFoundError(f"Account {number} does not exist in this book.")
 
 
-def get_account(book, number: int) -> dict:
-    with book.connect_read() as conn:
-        row = conn.execute(f"{SELECT} WHERE numero = ?", (number,)).fetchone()
-    if row is None:
-        raise AccountNotFoundError(f"Account {number} does not exist in this book.")
-    return _row_to_account(row)
-
-
-def account_on(conn, number: int) -> dict:
-    """Same result as get_account, on a connection the caller already has open.
-
-    For a caller, such as reconcile.py, that already opened a read
-    connection for the query the account number feeds into: validating the
-    number needs no connection of its own.
-    """
-    row = conn.execute(f"{SELECT} WHERE numero = ?", (number,)).fetchone()
-    if row is None:
-        raise AccountNotFoundError(f"Account {number} does not exist in this book.")
-    return _row_to_account(row)
-
-
-def _select_of_type(accounts: list[dict], tyyppi: str, description: str) -> int:
+def only_account_of_type(accounts: list[dict], tyyppi: str, description: str) -> int:
+    """The book's one account of this type, or an error naming what to do instead."""
     matches = [a for a in accounts if a["type"] == tyyppi]
     if len(matches) == 0:
         raise AccountNotFoundError(
@@ -91,23 +84,8 @@ def _select_of_type(accounts: list[dict], tyyppi: str, description: str) -> int:
 
 
 def default_bank_account_of(accounts: list[dict]) -> int:
-    """Same rule as default_bank_account, over a chart already loaded."""
-    return _select_of_type(accounts, TILITYYPPI_PANKKI, "bank account")
+    return only_account_of_type(accounts, TILITYYPPI_PANKKI, "bank account")
 
 
-def _first_of_type(book, tyyppi: str, description: str) -> int:
-    return _select_of_type(list_accounts(book), tyyppi, description)
-
-
-def default_bank_account(book) -> int:
-    return _first_of_type(book, TILITYYPPI_PANKKI, "bank account")
-
-
-def default_bank_account_on(conn) -> int:
-    """Same result as default_bank_account, on a connection the caller already has open."""
-    rows = conn.execute(f"{SELECT} WHERE tyyppi = ? ORDER BY numero", (TILITYYPPI_PANKKI,)).fetchall()
-    return _select_of_type([_row_to_account(r) for r in rows], TILITYYPPI_PANKKI, "bank account")
-
-
-def default_payable_account(book) -> int:
-    return _first_of_type(book, TILITYYPPI_OSTOVELAT, "payables account")
+def default_payable_account_of(accounts: list[dict]) -> int:
+    return only_account_of_type(accounts, TILITYYPPI_OSTOVELAT, "payables account")

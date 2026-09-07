@@ -11,7 +11,9 @@ The rule: trim and case-fold both sides, take an exact name match if there is
 one, otherwise a substring match. One match is the answer, several is
 AmbiguousSupplierError, none is None. Never pick between real partners in
 someone's books: which supplier a bill belongs to is the bookkeeper's call, not
-this server's.
+this server's. The fold is Python's str.casefold, registered on the connection,
+because SQLite's own lower() and LIKE fold ASCII only and this is a Finnish
+application: 'Kärkkäinen Oy' and 'KÄRKKÄINEN OY' have to be one partner.
 
 Callers differ only in what they do with each outcome. read.find_supplier wants
 the whole candidate list, so it uses the pattern helpers and not the resolver.
@@ -20,6 +22,7 @@ history returns no suggestions for None; write creates the partner.
 
 from typing import NamedTuple
 
+from .db import CASEFOLD
 from .errors import AmbiguousSupplierError
 
 # Backslash, the conventional LIKE escape. SQL sees ESCAPE '\'; a Python
@@ -27,9 +30,31 @@ from .errors import AmbiguousSupplierError
 LIKE_ESCAPE = "\\"
 ESCAPE_CLAUSE = "ESCAPE '\\'"
 
-_EXACT_SQL = "SELECT id, nimi FROM Kumppani WHERE lower(trim(nimi)) = lower(trim(?)) ORDER BY id"
+# Both sides of every comparison go through casefold(), the Python str.casefold
+# db.register_functions puts on the connection, not through SQLite's own
+# lower() or LIKE. SQLite folds ASCII only: lower('KÄRKKÄINEN') is unchanged
+# and 'KÄRKKÄINEN' LIKE '%kärkkäinen%' is 0, so on a Finnish name the fold
+# this module promises simply did not happen and the duplicate partner it
+# exists to prevent appeared anyway. LIKE still does the wildcard matching,
+# but with both sides already folded it only ever compares like with like.
+
+
+def folded(expression: str = "?") -> str:
+    """The comparable form of a piece of SQL text: trimmed and case-folded.
+
+    Wrapped around BOTH sides of every case-insensitive comparison in this
+    package, the column and the caller's own text alike, so the two are
+    never folded by different rules. The default is the bound parameter,
+    which is the side written most often.
+    """
+    return f"{CASEFOLD}(trim({expression}))"
+
+
+_EXACT_SQL = (
+    f"SELECT id, nimi FROM Kumppani WHERE {folded('nimi')} = {folded()} ORDER BY id"
+)
 _LIKE_SQL = (
-    f"SELECT id, nimi FROM Kumppani WHERE lower(trim(nimi)) LIKE lower(?) {ESCAPE_CLAUSE} "
+    f"SELECT id, nimi FROM Kumppani WHERE {folded('nimi')} LIKE {folded()} {ESCAPE_CLAUSE} "
     "ORDER BY id"
 )
 

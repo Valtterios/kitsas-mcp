@@ -30,6 +30,28 @@ MAX_BACKUP_ATTEMPTS = 1000
 # survive as "C:/...".
 URI_SAFE_CHARACTERS = "/:"
 
+# The name the Python casefold below is registered under on every connection.
+# SQLite's own lower() and LIKE fold ASCII only: lower('KÄRKKÄINEN') comes
+# back unchanged and 'KÄRKKÄINEN' LIKE '%kärkkäinen%' is 0. This is a Finnish
+# application, so å, ä and ö decide whether a supplier is found at all.
+CASEFOLD = "casefold"
+
+
+def _casefold(value):
+    """str.casefold, as a SQL function. NULL in, NULL out, like SQLite's own."""
+    return None if value is None else str(value).casefold()
+
+
+def register_functions(conn) -> None:
+    """Put the Python helpers every query in this package may use on a connection.
+
+    Registered on both the read and the write connection, so a name is
+    matched by the same rule whichever one the caller happens to hold.
+    Deterministic, so SQLite may use it in an index or a partial index
+    without caching a stale answer.
+    """
+    conn.create_function(CASEFOLD, 1, _casefold, deterministic=True)
+
 
 def _is_corruption(exc: sqlite3.DatabaseError) -> bool:
     text = str(exc).lower()
@@ -104,7 +126,20 @@ class Book:
     # -- connections ----------------------------------------------------
 
     def _read_uri(self) -> str:
-        return "file:" + quote(self.path.as_posix(), safe=URI_SAFE_CHARACTERS) + "?mode=ro"
+        """The read-only URI for this book, including the UNC case.
+
+        A Windows UNC path, `\\\\server\\share\\book.kitsas`, comes out of
+        as_posix() as `//server/share/book.kitsas`. Pasted after "file:"
+        that reads as the authority "server", which SQLite refuses outright
+        ("invalid uri authority: server"), so every read tool failed on a
+        book kept on a NAS while connect_write, which does not use a URI,
+        opened the same file happily. Two more slashes leave the authority
+        empty, which is the form SQLite documents for a UNC path, and the
+        path stays the UNC path Windows expects.
+        """
+        encoded = quote(self.path.as_posix(), safe=URI_SAFE_CHARACTERS)
+        prefix = "file://" if encoded.startswith("//") else "file:"
+        return prefix + encoded + "?mode=ro"
 
     @contextmanager
     def connect_read(self):
@@ -125,6 +160,7 @@ class Book:
                 ) from None
             raise
         conn.row_factory = sqlite3.Row
+        register_functions(conn)
         try:
             conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
             yield conn
@@ -150,6 +186,7 @@ class Book:
         self.backup()
         conn = sqlite3.connect(self.path, timeout=BUSY_TIMEOUT_MS / 1000, isolation_level=None)
         conn.row_factory = sqlite3.Row
+        register_functions(conn)
         try:
             conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
             conn.execute("PRAGMA foreign_keys = ON")

@@ -2,7 +2,6 @@ import pytest
 
 from kitsas_mcp.errors import DateFormatError, LedgerVoucherError, NoFiscalYearError
 from kitsas_mcp.read import (
-    FISCAL_YEAR_CONFIRMED_UNKNOWN,
     find_supplier,
     fiscal_year_for,
     get_voucher,
@@ -16,6 +15,8 @@ def test_lists_fiscal_years_and_marks_the_confirmed_one(book):
     assert [y["starts"] for y in years] == ["2025-01-01", "2026-01-01"]
     assert years[0]["confirmed"] == "2026-04-28"
     assert years[1]["confirmed"] is None
+    # A readable year is never "unknown", whether it is confirmed or not.
+    assert [y["confirmed_unknown"] for y in years] == [False, False]
 
 
 # -- Finding 1: malformed Tilikausi.json must not crash list_fiscal_years ----
@@ -40,11 +41,12 @@ def test_list_fiscal_years_survives_malformed_json(book):
     assert [y["starts"] for y in years] == ["2025-01-01", "2026-01-01", "2027-01-01"]
     broken = years[2]
     assert broken["ends"] == "2027-12-31"
-    # Unknown, not None: None would read as "not confirmed" and let a write
-    # through a year that might really be closed. See the module docstring
-    # on FISCAL_YEAR_CONFIRMED_UNKNOWN for the full reasoning.
-    assert broken["confirmed"] == FISCAL_YEAR_CONFIRMED_UNKNOWN
-    assert bool(broken["confirmed"]) is True
+    # "confirmed" stays what it claims to be, an ISO date or null, so a
+    # client comparing it against other dates is never handed a sentence.
+    # The doubt lives in its own boolean, and _check_fiscal_year refuses
+    # the write on that; see test_write.py.
+    assert broken["confirmed"] is None
+    assert broken["confirmed_unknown"] is True
 
 
 def test_list_fiscal_years_treats_valid_non_object_json_the_same_as_unreadable(book):
@@ -56,7 +58,8 @@ def test_list_fiscal_years_treats_valid_non_object_json_the_same_as_unreadable(b
         )
 
     years = list_fiscal_years(book)
-    assert years[2]["confirmed"] == FISCAL_YEAR_CONFIRMED_UNKNOWN
+    assert years[2]["confirmed"] is None
+    assert years[2]["confirmed_unknown"] is True
 
 
 def test_fiscal_year_for_reports_the_unknown_sentinel_for_a_corrupt_year(book):
@@ -67,7 +70,8 @@ def test_fiscal_year_for_reports_the_unknown_sentinel_for_a_corrupt_year(book):
         )
 
     year = fiscal_year_for(book, "2027-06-15")
-    assert year["confirmed"] == FISCAL_YEAR_CONFIRMED_UNKNOWN
+    assert year["confirmed"] is None
+    assert year["confirmed_unknown"] is True
 
 
 def test_fiscal_year_for_a_date_inside_a_year(book):
@@ -209,3 +213,8 @@ def test_find_supplier_still_matches_a_name_containing_a_backslash(book, book_pa
     _add_partner(book_path, "A\\B Oy")
 
     assert [p["name"] for p in find_supplier(book, "A\\B")] == ["A\\B Oy"]
+
+
+def test_find_supplier_ignores_whitespace_around_the_query(book):
+    """resolve_partner strips; find_supplier used not to, and found nothing."""
+    assert [p["id"] for p in find_supplier(book, "  Hetzner  ")] == [7]

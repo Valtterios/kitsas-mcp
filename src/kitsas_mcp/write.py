@@ -6,16 +6,22 @@ into the ledger and allocates its number when a human approves it. This server
 never does either, and never touches a voucher that is already in the ledger.
 
 Nothing outside the voucher being created is ever rewritten. A partner may be
-created, and a blank business id filled in on a partner that has no ledger
-history yet, but an existing IBAN binding is never re-pointed and neither a
-business id nor an IBAN on an established partner is ever overwritten. A
-supplier name that already identifies a partner joins that partner rather than
-forking a second one beside it; the name is resolved by partners.py, the same
-rule suggest_account answers with, and a match on a name that is not the
-partner's own is named in the summary. An IBAN
-that belongs elsewhere is refused; a business id on an established partner is
-left alone and reported in the summary, because the voucher does not depend on
-it and refusing would block the ordinary path.
+created, and a blank business id filled in and an IBAN bound on a partner the
+caller identified exactly, but an existing IBAN binding is never re-pointed and
+neither a business id nor an IBAN on an established partner is ever
+overwritten. A supplier name that already identifies a partner joins that
+partner rather than forking a second one beside it; the name is resolved by
+partners.py, the same rule suggest_account answers with, and a match on a name
+that is not the partner's own is named in the summary. An IBAN that belongs
+elsewhere is refused; a business id on an established partner is left alone and
+reported in the summary, because the voucher does not depend on it and refusing
+would block the ordinary path.
+
+When the partner was found only by a substring of its name, the voucher is
+still written but the business id and the IBAN are not. The voucher is a
+reversible draft; those two are edits to somebody else's row that delete_draft
+does not undo. partner_id names a partner outright, with no name matching at
+all, for the cases where the name rule cannot reach the right one.
 """
 
 import hashlib
@@ -44,11 +50,12 @@ from .errors import (
     KitsasError,
     LedgerVoucherError,
     LineFormatError,
+    PartnerNotFoundError,
     UnbalancedVoucherError,
 )
 from .money import cents_to_euros, euros_to_cents
-from .partners import resolve_partner
-from .read import FISCAL_YEAR_CONFIRMED_UNKNOWN, fiscal_year_for, no_such_voucher_error
+from .partners import PartnerMatch, resolve_partner
+from .read import CONFIRMED_UNKNOWN_KEY, fiscal_year_for, no_such_voucher_error
 
 # The voucher states delete_draft is actually meant for: a document waiting
 # in the inbox, one that has been checked or accepted but not yet booked, and
@@ -68,11 +75,12 @@ _NON_DELETABLE_STATE_NAMES = {
     TILA_HYLATTY: "a rejected document",
 }
 
-# add_purchase_invoice takes a supplier name and no partner id, so the way out
-# of an ambiguity here is a name the book matches only once.
+# The ways out of an ambiguity here, in the order they are worth trying:
+# name the partner outright with partner_id, narrow the name, or merge the
+# partners in Kitsas if they are really one supplier.
 AMBIGUITY_REMEDY = (
-    "Use a name that matches exactly one of them, or merge them in Kitsas; "
-    "find_supplier lists them."
+    "Pass partner_id to say which one you mean, use a name that matches exactly one "
+    "of them, or merge them in Kitsas; find_supplier lists them with their ids."
 )
 
 # An invoice scan is a few hundred kilobytes. Anything past this is a wrong
@@ -89,7 +97,7 @@ TOSITE_INSERT = (
 
 def _check_fiscal_year(book, booking_date: str) -> None:
     year = fiscal_year_for(book, booking_date)
-    if year["confirmed"] == FISCAL_YEAR_CONFIRMED_UNKNOWN:
+    if year[CONFIRMED_UNKNOWN_KEY]:
         # Whether this year was confirmed cannot be read at all (Tilikausi.json
         # is corrupt). Refusing is the safe direction: reporting it as
         # unconfirmed instead would let a write through a year that might
@@ -193,11 +201,83 @@ def _matched_partner_note(typed: str, matched_name: str) -> str:
     the book. But the voucher is being attached to a partner spelled
     differently from what was typed, and on someone's books that is worth
     reading rather than guessing at.
+
+    The remedy named here has to be one that can actually work. It used to be
+    "pass the full name", which is the very input that just failed: a supplier
+    whose real name is contained in an existing partner's name, a sole trader
+    "Nieminen" against the member "Kari Nieminen", matches that partner however
+    fully it is spelled. partner_id is the way out, because it does not go
+    through name matching at all.
     """
     return (
         f"Booked to {matched_name}, the partner already in this book that {typed!r} "
-        "matched; no new partner was created. Pass the full name if you meant a "
-        "different supplier."
+        "matched; no new partner was created. If that is the wrong partner, pass "
+        "partner_id for the right one (find_supplier lists the ids), or add the "
+        "supplier in Kitsas first."
+    )
+
+
+def _fuzzy_write_skipped_note(lead: str, typed: str) -> str:
+    """Say that a write onto an existing partner's own data was skipped, and why.
+
+    Same shape as the business-id skip note below: what was left alone, why,
+    and what to do if it really was meant. The voucher is a draft and can be
+    deleted; a business id or an IBAN written onto a partner cannot be undone
+    by delete_draft, only by restoring a backup. So when the partner was found
+    by a substring of its name rather than by the name itself, which is a
+    guess, those two writes do not happen at all.
+    """
+    return (
+        f"{lead}, because {typed!r} only matched inside that partner's name rather than "
+        "being the name itself. Pass partner_id if that really is the supplier, or make "
+        "the change in Kitsas."
+    )
+
+
+def _partner_id_number(value) -> int:
+    """The partner id as a number. JSON may deliver it as the string '7'."""
+    text = str(value).strip()
+    if isinstance(value, bool) or not (text.isascii() and text.isdigit()):
+        raise PartnerNotFoundError(
+            f"partner_id is {value!r}, which is not a partner id. Pass the number "
+            "find_supplier returns as 'id', or leave partner_id out to match the "
+            "supplier by name."
+        )
+    return int(text)
+
+
+def _partner_by_id(conn, partner_id) -> PartnerMatch:
+    """The partner this id names, with no name matching of any kind.
+
+    The escape hatch from the name rule. A partner named this way is exact by
+    construction: the caller pointed at one row, so nothing here is a guess,
+    and the business id and IBAN writes below go ahead as they do for a name
+    that was the partner's own.
+    """
+    number = _partner_id_number(partner_id)
+    row = conn.execute("SELECT id, nimi FROM Kumppani WHERE id = ?", (number,)).fetchone()
+    if row is None:
+        raise PartnerNotFoundError(
+            f"There is no partner {number} in this book. Use find_supplier to get the "
+            "id of the supplier you meant, or leave partner_id out to match by name."
+        )
+    return PartnerMatch(row["id"], row["nimi"], True)
+
+
+def _named_partner_note(typed: str, matched: str) -> str | None:
+    """Note the mismatch when partner_id and supplier_name disagree, or None.
+
+    partner_id decides which partner the voucher belongs to; supplier_name is
+    then only the text on the voucher. That is the point of the argument, so
+    the mismatch is reported rather than refused: the name printed on an
+    invoice often is not the name the partner is filed under, and that is
+    exactly when a bookkeeper reaches for the id.
+    """
+    if typed.strip().casefold() == str(matched).strip().casefold():
+        return None
+    return (
+        f"Booked to {matched}, the partner partner_id names. The supplier name "
+        f"{typed!r} was not looked up at all; it is the voucher's text only."
     )
 
 
@@ -264,40 +344,72 @@ def _fill_blank_business_id(conn, supplier_id: int, name: str, business_id) -> s
     return None
 
 
-def _upsert_supplier(conn, name: str, business_id, iban) -> tuple[int, str, list[str]]:
+def _upsert_supplier(
+    conn, name: str, business_id, iban, partner_id=None
+) -> tuple[int, str, list[str]]:
     """Return the partner id, the name it is filed under, and notes for the summary.
 
-    The name is resolved by the rule in partners.py, the same one
+    With partner_id the partner is that row and nothing is resolved. Without
+    it the name is resolved by the rule in partners.py, the same one
     suggest_account answered with a moment earlier, so a bill for a supplier
     that is already in the book joins that partner instead of forking a second
     one that carries none of its history. A name that matches nothing really is
     a new supplier, and that partner is created here.
+
+    Only the voucher is written when the partner was found by a substring of
+    its name. The business id and the IBAN are edits to a partner that already
+    existed, they survive delete_draft, and a substring match is a guess: a
+    sole trader "Nieminen" matches the member "Kari Nieminen", and it is that
+    member's record that would otherwise take the supplier's IBAN and business
+    id. Both are skipped and named in the summary instead.
     """
     notes = []
-    match = resolve_partner(conn, name, remedy=AMBIGUITY_REMEDY)
+    if partner_id is not None:
+        match = _partner_by_id(conn, partner_id)
+        named = _named_partner_note(name, match.name)
+        if named:
+            notes.append(named)
+    else:
+        match = resolve_partner(conn, name, remedy=AMBIGUITY_REMEDY)
 
     if match is None:
         cursor = conn.execute(
             "INSERT INTO Kumppani (nimi, alvtunnus, json) VALUES (?,?,?)",
             (name, business_id, "{}"),
         )
-        supplier_id, filed_as = cursor.lastrowid, name
+        # A partner created here is filed under exactly the name that was
+        # typed, and has no data of its own for this call to overwrite.
+        supplier_id, filed_as, identified = cursor.lastrowid, name, True
     else:
-        supplier_id, filed_as = match.id, match.name
-        if not match.exact:
+        supplier_id, filed_as, identified = match.id, match.name, match.exact
+        if not identified:
             notes.append(_matched_partner_note(name, filed_as))
         if business_id:
-            existing = conn.execute(
-                "SELECT coalesce(alvtunnus,'') AS alvtunnus FROM Kumppani WHERE id = ?",
-                (supplier_id,),
-            ).fetchone()
-            if existing["alvtunnus"] == "":
-                skipped = _fill_blank_business_id(conn, supplier_id, filed_as, business_id)
-                if skipped:
-                    notes.append(skipped)
+            if not identified:
+                notes.append(
+                    _fuzzy_write_skipped_note(
+                        f"Left the business id unchanged on {filed_as}", name
+                    )
+                )
+            else:
+                existing = conn.execute(
+                    "SELECT coalesce(alvtunnus,'') AS alvtunnus FROM Kumppani WHERE id = ?",
+                    (supplier_id,),
+                ).fetchone()
+                if existing["alvtunnus"] == "":
+                    skipped = _fill_blank_business_id(conn, supplier_id, filed_as, business_id)
+                    if skipped:
+                        notes.append(skipped)
 
     if iban:
-        _bind_iban(conn, supplier_id, filed_as, iban)
+        if identified:
+            _bind_iban(conn, supplier_id, filed_as, iban)
+        else:
+            notes.append(
+                _fuzzy_write_skipped_note(
+                    f"Did not bind the IBAN {_normalise_iban(iban)} to {filed_as}", name
+                )
+            )
     return supplier_id, filed_as, notes
 
 
@@ -351,6 +463,7 @@ def add_purchase_invoice(
     booking_date: str,
     business_id=None,
     iban=None,
+    partner_id=None,
     invoice_date=None,
     due_date=None,
     reference=None,
@@ -358,7 +471,18 @@ def add_purchase_invoice(
     credit_account=None,
     pdf_path=None,
 ) -> dict:
-    """Create a purchase invoice as a draft. Kitsas approves it into the ledger."""
+    """Create a purchase invoice as a draft. Kitsas approves it into the ledger.
+
+    partner_id, when given, names the partner outright: no name matching of
+    any kind happens, the partner must exist, and supplier_name is then only
+    the text that goes on the voucher.
+    """
+    # booking_date is validated here rather than only inside
+    # _check_fiscal_year, whose own parse was a side effect: the raw value
+    # went on to be bound into Tosite.pvm and both Vienti.pvm columns, where
+    # an unpadded "2026-2-28" compares wrong as text against every other
+    # date in the book. Assigned like invoice_date and due_date below.
+    booking_date = parse_iso_date(booking_date, "booking_date")
     _check_fiscal_year(book, booking_date)
 
     supplier_name = str(supplier_name).strip()
@@ -368,18 +492,18 @@ def add_purchase_invoice(
             "on the voucher, for example 'Telia Finland Oyj'."
         )
 
-    # Optional, but not free-form: booking_date is already validated via
-    # _check_fiscal_year above. invoice_date and due_date are stored as-is
-    # into laskupvm/erapvm with no fiscal-year check of their own, so without
-    # this they would be the only two date fields on this voucher a malformed
-    # value could reach unchecked.
+    # Optional, but not free-form: booking_date was validated and reassigned
+    # above. invoice_date and due_date are stored as-is into laskupvm/erapvm
+    # with no fiscal-year check of their own, so without this they would be
+    # the only two date fields on this voucher a malformed value could reach
+    # unchecked.
     if invoice_date is not None:
         invoice_date = parse_iso_date(invoice_date, "invoice_date")
     if due_date is not None:
         due_date = parse_iso_date(due_date, "due_date")
 
     # Loaded once and validated against in memory: a five-line bill used to
-    # open a fresh connection per get_account call plus one more for the
+    # open a fresh connection per account lookup, plus one more for the
     # default bank account, all before the write transaction even opened.
     accounts = list_accounts(book)
 
@@ -399,7 +523,7 @@ def add_purchase_invoice(
 
     with book.connect_write() as conn:
         supplier_id, filed_as, supplier_notes = _upsert_supplier(
-            conn, supplier_name, business_id, iban
+            conn, supplier_name, business_id, iban, partner_id
         )
 
         cursor = conn.execute(

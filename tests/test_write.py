@@ -21,6 +21,7 @@ from kitsas_mcp.errors import (
     LedgerVoucherError,
     LineFormatError,
     NoFiscalYearError,
+    PartnerNotFoundError,
     UnbalancedVoucherError,
 )
 from kitsas_mcp.read import get_voucher
@@ -316,8 +317,10 @@ def test_delete_draft_refuses_a_voucher_template(book, book_path):
     with pytest.raises(LedgerVoucherError) as excinfo:
         delete_draft(book, 5)
     message = str(excinfo.value)
-    assert "template" in message
-    assert "5" in message
+    # "5" alone proved nothing: the list of deletable states the message
+    # ends with, [20, 30, 40, 50], contains a "5" whatever the voucher was.
+    assert "Voucher 5 is a voucher template Kitsas keeps for reuse" in message
+    assert "manage this voucher in Kitsas directly instead" in message
     assert get_voucher(book, 5)["state"] == TILA_MALLIPOHJA
 
 
@@ -506,13 +509,31 @@ def test_a_match_on_a_name_that_is_not_the_partners_own_is_named_in_the_summary(
     summary = add_purchase_invoice(book, **{**BILL, "supplier_name": "Hetzner"})["summary"]
     assert "Hetzner Online GmbH" in summary
     assert "no new partner was created" in summary
-    assert "Pass the full name if you meant a different supplier" in summary
+    # The remedy has to be one that can work. "Pass the full name" was not:
+    # a supplier whose real name is contained in an existing partner's name
+    # matches that partner however fully it is spelled, so the advice sent
+    # the caller back to the input that had just failed.
+    assert "partner_id" in summary
+    assert "find_supplier" in summary
+    assert "Pass the full name" not in summary
 
 
 def test_the_summary_says_nothing_when_the_name_was_the_partners_own(book):
-    """An exact match is what the caller asked for and needs no remark."""
-    summary = add_purchase_invoice(book, **{**BILL, "supplier_name": "Hetzner"})["summary"]
+    """An exact match is what the caller asked for and needs no remark.
+
+    Asserting only the absence would pass on an empty summary, so the
+    summary's real content is pinned here as well: the absence only means
+    something if there is a summary for the remark to be missing from.
+    """
+    result = add_purchase_invoice(book, **{**BILL, "supplier_name": "Hetzner"})
+    summary = result["summary"]
+    assert summary.startswith(
+        f"Draft voucher {result['voucher_id']} for Hetzner, 42.90 euros on 2026-05-04, "
+        "credited to account 1910."
+    )
+    assert "It is not in the ledger; open Kitsas to check and approve it." in summary
     assert "no new partner was created" not in summary
+    assert "partner_id" not in summary
 
 
 def test_a_name_that_matches_no_partner_still_creates_one(book):
@@ -793,3 +814,238 @@ def test_a_partner_with_ledger_history_takes_an_invoice_without_a_business_id(bo
     """The refusal is about the business id only, not about invoicing an old supplier."""
     result = add_purchase_invoice(book, **{**BILL, "supplier_name": "Hetzner"})
     assert get_voucher(book, result["voucher_id"])["supplier"] == "Hetzner"
+
+
+# -- Finding 1: a fuzzy match gets the voucher and nothing else ---------------
+# The voucher is a draft and delete_draft undoes it. A business id and an IBAN
+# written onto a partner that already existed are not undone by anything short
+# of restoring a backup, and a substring match is a guess: a sole trader
+# "Nieminen" matches the member "Kari Nieminen", and it was that member's row
+# that took the supplier's IBAN and business id.
+
+
+def _add_member(book_path, name):
+    """A member with no business id, no IBAN and no bookkeeping history."""
+    conn = sqlite3.connect(book_path)
+    cursor = conn.execute("INSERT INTO Kumppani (nimi, json) VALUES (?, '{}')", (name,))
+    partner_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return partner_id
+
+
+def _partner_row(book, partner_id):
+    with book.connect_read() as conn:
+        partner = conn.execute(
+            "SELECT nimi, alvtunnus FROM Kumppani WHERE id = ?", (partner_id,)
+        ).fetchone()
+        ibans = [
+            r["iban"]
+            for r in conn.execute(
+                "SELECT iban FROM KumppaniIban WHERE kumppani = ?", (partner_id,)
+            )
+        ]
+    return partner, ibans
+
+
+def test_a_fuzzy_match_writes_neither_the_iban_nor_the_business_id_and_says_so(book, book_path):
+    member = _add_member(book_path, "Kari Nieminen")
+
+    result = add_purchase_invoice(
+        book,
+        **{
+            **BILL,
+            "supplier_name": "Nieminen",
+            "business_id": "1234567-8",
+            "iban": "FI21 1234 5600 0007 85",
+        },
+    )
+
+    partner, ibans = _partner_row(book, member)
+    assert (partner["alvtunnus"] or "") == "", "a guessed partner keeps its own business id"
+    assert ibans == [], "a guessed partner does not get the supplier's IBAN bound to it"
+
+    summary = result["summary"]
+    assert "Left the business id unchanged on Kari Nieminen" in summary
+    assert "Did not bind the IBAN FI2112345600000785 to Kari Nieminen" in summary
+    assert "only matched inside that partner's name" in summary
+    assert "Pass partner_id" in summary
+
+    # The voucher itself is still written, and is still a deletable draft.
+    assert get_voucher(book, result["voucher_id"])["state"] == 20
+
+
+def test_an_exact_match_still_writes_the_business_id_and_the_iban(book, book_path):
+    """Unchanged behaviour for the ordinary case: the name was the partner's own."""
+    seeded = _add_member(book_path, "Verkkokauppa")
+
+    result = add_purchase_invoice(
+        book,
+        **{
+            **BILL,
+            "supplier_name": "Verkkokauppa",
+            "business_id": "1234567-8",
+            "iban": "FI21 1234 5600 0007 85",
+        },
+    )
+
+    partner, ibans = _partner_row(book, seeded)
+    assert partner["alvtunnus"] == "1234567-8"
+    assert ibans == ["FI2112345600000785"]
+    assert result["supplier_id"] == seeded
+    assert "Left the business id unchanged" not in result["summary"]
+    assert "Did not bind the IBAN" not in result["summary"]
+
+
+def test_deleting_the_draft_would_not_have_undone_those_two_writes(book, book_path):
+    """Why they are gated: delete_draft reverses the voucher and nothing else."""
+    seeded = _add_member(book_path, "Verkkokauppa")
+    result = add_purchase_invoice(
+        book,
+        **{
+            **BILL,
+            "supplier_name": "Verkkokauppa",
+            "business_id": "1234567-8",
+            "iban": "FI21 1234 5600 0007 85",
+        },
+    )
+
+    delete_draft(book, result["voucher_id"])
+
+    partner, ibans = _partner_row(book, seeded)
+    assert get_voucher(book, result["voucher_id"])["state"] == TILA_POISTETTU
+    assert partner["alvtunnus"] == "1234567-8"
+    assert ibans == ["FI2112345600000785"]
+
+
+# -- Finding 2: partner_id is the way out when the name rule cannot be right --
+
+
+def test_partner_id_bypasses_name_resolution_entirely(book, book_path):
+    """A name that would be ambiguous, or would match the wrong partner, is not used."""
+    conn = sqlite3.connect(book_path)
+    conn.execute("UPDATE Kumppani SET nimi = 'Hetzner Online GmbH' WHERE id = 7")
+    conn.execute("INSERT INTO Kumppani (nimi, json) VALUES ('Hetzner Cloud', '{}')")
+    conn.commit()
+    conn.close()
+
+    # The same name on its own is refused as ambiguous; see
+    # test_a_shortened_name_matching_two_partners_is_refused_and_writes_nothing.
+    result = add_purchase_invoice(
+        book, **{**BILL, "supplier_name": "Hetzner", "partner_id": 7}
+    )
+
+    assert result["supplier_id"] == 7
+    assert result["supplier"] == "Hetzner Online GmbH"
+    assert get_voucher(book, result["voucher_id"])["supplier_id"] == 7
+
+
+def test_partner_id_reaches_a_partner_no_name_could(book, book_path):
+    """The dead end this argument exists for.
+
+    A sole trader "Nieminen" is a substring of the member "Kari Nieminen", so
+    every spelling of the trader's name resolves to the member. Adding the
+    trader in Kitsas and passing its id is the way through.
+    """
+    _add_member(book_path, "Kari Nieminen")
+    trader = _add_member(book_path, "Nieminen")
+
+    result = add_purchase_invoice(
+        book,
+        **{**BILL, "supplier_name": "Nieminen", "partner_id": trader, "business_id": "1234567-8"},
+    )
+
+    assert result["supplier_id"] == trader
+    partner, _ = _partner_row(book, trader)
+    assert partner["alvtunnus"] == "1234567-8", "an id is not a guess, so the fill goes ahead"
+    assert "only matched inside" not in result["summary"]
+
+
+def test_a_partner_id_that_does_not_exist_is_refused_and_writes_nothing(book):
+    with pytest.raises(PartnerNotFoundError) as excinfo:
+        add_purchase_invoice(book, **{**BILL, "partner_id": 4242})
+    message = str(excinfo.value)
+    assert "There is no partner 4242 in this book" in message
+    assert "find_supplier" in message
+    assert "leave partner_id out" in message
+
+    with book.connect_read() as conn:
+        assert conn.execute("SELECT count(*) FROM Tosite").fetchone()[0] == 4
+        assert conn.execute("SELECT count(*) FROM Kumppani").fetchone()[0] == 2
+
+
+def test_a_partner_id_that_is_not_an_id_at_all_is_refused(book):
+    with pytest.raises(PartnerNotFoundError) as excinfo:
+        add_purchase_invoice(book, **{**BILL, "partner_id": "Hetzner"})
+    assert "is not a partner id" in str(excinfo.value)
+    assert "find_supplier" in str(excinfo.value)
+
+
+def test_a_partner_id_sent_as_a_digit_string_is_still_an_id(book):
+    """JSON from an MCP client can deliver 7 as "7"."""
+    result = add_purchase_invoice(book, **{**BILL, "partner_id": "7"})
+    assert result["supplier_id"] == 7
+
+
+def test_partner_id_decides_the_partner_and_supplier_name_only_the_text(book):
+    """The rule when the two disagree: partner_id wins, and the summary says so.
+
+    supplier_name is not looked up at all, so it cannot quietly pull the
+    voucher onto some other partner, and the partner it does name is stated
+    in the summary rather than left to be inferred from the id.
+    """
+    result = add_purchase_invoice(
+        book, **{**BILL, "supplier_name": "Verohallinto", "partner_id": 7}
+    )
+
+    assert result["supplier_id"] == 7
+    assert result["supplier"] == "Hetzner"
+    summary = result["summary"]
+    assert "Booked to Hetzner, the partner partner_id names" in summary
+    assert "was not looked up at all" in summary
+
+    voucher = get_voucher(book, result["voucher_id"])
+    assert voucher["supplier"] == "Hetzner"
+    # The name is still the voucher's own text, which is what it is for.
+    assert voucher["title"] == BILL["description"]
+
+    with book.connect_read() as conn:
+        # Verohallinto, the partner the name would have found, is untouched.
+        assert conn.execute("SELECT count(*) FROM Tosite WHERE kumppani = 1").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM Kumppani").fetchone()[0] == 2
+
+
+def test_partner_id_and_a_matching_supplier_name_need_no_remark(book):
+    result = add_purchase_invoice(
+        book, **{**BILL, "supplier_name": "  hetzner  ", "partner_id": 7}
+    )
+    assert result["supplier_id"] == 7
+    assert "partner_id names" not in result["summary"]
+
+
+# -- Finding 7: the booking date that reaches SQL is the validated one --------
+
+
+def test_an_unpadded_booking_date_is_refused_by_name(book, book_path):
+    before = book_path.read_bytes()
+    with pytest.raises(DateFormatError) as excinfo:
+        add_purchase_invoice(book, **{**BILL, "booking_date": "2026-5-4"})
+    assert "booking_date" in str(excinfo.value)
+    assert book_path.read_bytes() == before
+
+
+def test_the_booking_date_bound_into_sql_is_the_normalised_one(book):
+    """The fiscal-year check parsed it; the raw value was what reached the rows."""
+    result = add_purchase_invoice(book, **{**BILL, "booking_date": "2026-05-04"})
+    with book.connect_read() as conn:
+        header = conn.execute(
+            "SELECT pvm FROM Tosite WHERE id = ?", (result["voucher_id"],)
+        ).fetchone()
+        dates = {
+            r["pvm"]
+            for r in conn.execute(
+                "SELECT pvm FROM Vienti WHERE tosite = ?", (result["voucher_id"],)
+            )
+        }
+    assert header["pvm"] == "2026-05-04"
+    assert dates == {"2026-05-04"}

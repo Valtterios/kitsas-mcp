@@ -5,7 +5,7 @@ reconciled the ledger's bank account against the bank. Every automated bill
 asserts a payment; this is how a wrong one gets found.
 """
 
-from .accounts import account_on, default_bank_account_on
+from .accounts import account_by_number, accounts_on, default_bank_account_of
 from .constants import TILA_KIRJANPIDOSSA, TILITYYPPI_PANKKI
 from .dates import parse_iso_date
 from .errors import NotABankAccountError
@@ -17,7 +17,9 @@ def _resolve_account(conn, account):
 
     Takes the connection the caller already opened for the balance query
     itself, so resolving the account (explicit or default) needs no
-    connection of its own.
+    connection of its own: the chart is read once here and both questions,
+    "is this account real and a bank account" and "which is the default
+    bank account", are answered from that one list.
 
     Both bank_balance and bank_movements advertise themselves as reporting
     on the bank account, for checking against a real bank statement. Any
@@ -25,8 +27,9 @@ def _resolve_account(conn, account):
     payables account) would still produce a number, but not a bank balance,
     so it is refused here rather than silently answered.
     """
+    chart = accounts_on(conn)
     if account is not None:
-        found = account_on(conn, account)  # raises AccountNotFoundError for a bad number
+        found = account_by_number(chart, account)  # raises AccountNotFoundError for a bad number
         if found["type"] != TILITYYPPI_PANKKI:
             raise NotABankAccountError(
                 f"Account {account} ({found['name'] or 'unnamed'}) is type {found['type']!r}, "
@@ -34,7 +37,7 @@ def _resolve_account(conn, account):
                 "bank account, or omit account to use the book's default bank account."
             )
         return account
-    return default_bank_account_on(conn)
+    return default_bank_account_of(chart)
 
 
 def _balance_cents(conn, account: int, on_date: str) -> int:
