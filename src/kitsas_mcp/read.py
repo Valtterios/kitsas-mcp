@@ -51,7 +51,8 @@ def find_supplier(book, query: str) -> list[dict]:
 def list_vouchers(book, date_from, date_to, supplier=None, account=None, state=None) -> list[dict]:
     sql = [
         "SELECT t.id, t.pvm, t.tyyppi, t.tila, t.tunniste, t.otsikko, t.erapvm, k.nimi AS kumppani,",
-        "       (SELECT sum(debetsnt) FROM Vienti WHERE tosite = t.id) AS summa",
+        "       (SELECT max(coalesce(sum(debetsnt), 0), coalesce(sum(kreditsnt), 0)) "
+        "        FROM Vienti WHERE tosite = t.id) AS summa",
         "FROM Tosite t LEFT JOIN Kumppani k ON k.id = t.kumppani",
         "WHERE t.pvm BETWEEN ? AND ?",
     ]

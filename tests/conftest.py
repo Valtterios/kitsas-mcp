@@ -64,6 +64,38 @@ def _build(path: Path) -> None:
             (n, pvm, cents),
         )
 
+    # A draft voucher (tila=20, below the TILA_KIRJANPIDOSSA=100 ledger
+    # threshold). Balanced, same shape as the ledger vouchers above. Must
+    # never appear in a default (no state=) list_vouchers() call.
+    conn.execute(
+        "INSERT INTO Tosite (id, pvm, tyyppi, tila, tunniste, otsikko, kumppani, laskupvm) "
+        "VALUES (3, '2026-04-15', 100, 20, NULL, 'Hetzner', 7, '2026-04-15')"
+    )
+    conn.execute(
+        "INSERT INTO Vienti (rivi, tosite, tyyppi, pvm, tili, kohdennus, selite, debetsnt, kreditsnt, kumppani) "
+        "VALUES (1, 3, 102, '2026-04-15', 1910, 0, 'Hetzner', 0, 2000, 7)"
+    )
+    conn.execute(
+        "INSERT INTO Vienti (rivi, tosite, tyyppi, pvm, tili, kohdennus, selite, debetsnt, kreditsnt, kumppani) "
+        "VALUES (2, 3, 101, '2026-04-15', 4590, 0, 'Hetzner', 2000, 0, 7)"
+    )
+
+    # A deliberately unbalanced draft (tila=50, a different draft state so
+    # it can be selected on its own). Debit total 1000 exceeds credit total
+    # 400, exercising the "report the greater side" behaviour of totals.
+    conn.execute(
+        "INSERT INTO Tosite (id, pvm, tyyppi, tila, tunniste, otsikko, kumppani, laskupvm) "
+        "VALUES (4, '2026-05-20', 100, 50, NULL, 'Hetzner', 7, '2026-05-20')"
+    )
+    conn.execute(
+        "INSERT INTO Vienti (rivi, tosite, tyyppi, pvm, tili, kohdennus, selite, debetsnt, kreditsnt, kumppani) "
+        "VALUES (1, 4, 101, '2026-05-20', 4590, 0, 'Hetzner', 1000, 0, 7)"
+    )
+    conn.execute(
+        "INSERT INTO Vienti (rivi, tosite, tyyppi, pvm, tili, kohdennus, selite, debetsnt, kreditsnt, kumppani) "
+        "VALUES (2, 4, 102, '2026-05-20', 1910, 0, 'Hetzner', 0, 400, 7)"
+    )
+
     conn.commit()
     conn.close()
 

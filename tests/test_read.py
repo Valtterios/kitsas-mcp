@@ -48,6 +48,23 @@ def test_list_vouchers_respects_the_date_range(book):
     assert list_vouchers(book, "2026-03-01", "2026-03-31")[0]["date"] == "2026-03-06"
 
 
+def test_list_vouchers_excludes_a_draft_by_default(book):
+    vouchers = list_vouchers(book, "2026-01-01", "2026-12-31")
+    assert {v["id"] for v in vouchers} == {1, 2}
+
+
+def test_list_vouchers_can_select_a_draft_state_explicitly(book):
+    drafts = list_vouchers(book, "2026-01-01", "2026-12-31", state=20)
+    assert len(drafts) == 1
+    assert drafts[0]["id"] == 3
+
+
+def test_list_vouchers_totals_an_unbalanced_voucher_with_the_larger_side(book):
+    vouchers = list_vouchers(book, "2026-01-01", "2026-12-31", state=50)
+    assert len(vouchers) == 1
+    assert vouchers[0]["total"] == "10.00"
+
+
 def test_get_voucher_returns_header_and_entries(book):
     voucher = get_voucher(book, 1)
     assert voucher["date"] == "2026-02-06"
