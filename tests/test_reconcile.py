@@ -1,3 +1,6 @@
+import pytest
+
+from kitsas_mcp.errors import AccountNotFoundError, DateFormatError
 from kitsas_mcp.reconcile import bank_balance, bank_movements
 
 
@@ -52,3 +55,48 @@ def test_drafts_do_not_appear_in_movements(book):
     )
     assert len(bank_movements(book, "2026-01-01", "2026-12-31")) == 2
     assert bank_balance(book, "2026-12-31")["balance"] == "-94.62"
+
+
+def test_balance_rejects_an_unpadded_date(book):
+    # "2026-2-28" sorts after "2026-03-06" under plain string comparison,
+    # which would silently produce a wrong balance if this were not caught.
+    with pytest.raises(DateFormatError) as excinfo:
+        bank_balance(book, "2026-2-28")
+    assert "2026-2-28" in str(excinfo.value)
+
+
+def test_movements_rejects_an_unpadded_date_from(book):
+    with pytest.raises(DateFormatError):
+        bank_movements(book, "2026-2-28", "2026-12-31")
+
+
+def test_movements_rejects_an_unpadded_date_to(book):
+    with pytest.raises(DateFormatError):
+        bank_movements(book, "2026-01-01", "2026-2-28")
+
+
+def test_balance_rejects_an_unknown_account(book):
+    with pytest.raises(AccountNotFoundError):
+        bank_balance(book, "2026-12-31", account=9999)
+
+
+def test_movements_rejects_an_unknown_account(book):
+    with pytest.raises(AccountNotFoundError):
+        bank_movements(book, "2026-01-01", "2026-12-31", account=9999)
+
+
+def test_balance_accepts_an_explicit_valid_account(book):
+    # A correct explicit account must still work; validation is not
+    # over-strict about the case that matches the book.
+    assert bank_balance(book, "2026-12-31", account=1910)["balance"] == "-94.62"
+
+
+def test_movements_accepts_the_minimum_possible_date_from(book):
+    # date_from="0001-01-01" pushes the opening-balance lookup to the day
+    # before date.min, which would otherwise raise OverflowError. There is
+    # trivially nothing before the minimum date, so this must return the
+    # same result as the ordinary from-the-beginning case rather than raise.
+    movements = bank_movements(book, "0001-01-01", "2026-12-31")
+    assert len(movements) == 2
+    assert movements[0]["running_balance"] == "-47.31"
+    assert movements[1]["running_balance"] == "-94.62"

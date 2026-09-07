@@ -1,6 +1,6 @@
 import pytest
 
-from kitsas_mcp.errors import NoFiscalYearError
+from kitsas_mcp.errors import DateFormatError, NoFiscalYearError
 from kitsas_mcp.read import find_supplier, fiscal_year_for, get_voucher, list_fiscal_years, list_vouchers
 
 
@@ -19,6 +19,31 @@ def test_fiscal_year_for_a_date_outside_every_year(book):
     with pytest.raises(NoFiscalYearError) as excinfo:
         fiscal_year_for(book, "2031-01-03")
     assert "2031-01-03" in str(excinfo.value)
+
+
+def test_fiscal_year_for_rejects_an_unpadded_date(book):
+    # "2026-5-4" sorts wrong against zero-padded fiscal year bounds under
+    # plain string comparison, so it must be rejected rather than silently
+    # matching (or failing to match) the wrong year.
+    with pytest.raises(DateFormatError) as excinfo:
+        fiscal_year_for(book, "2026-5-4")
+    assert "2026-5-4" in str(excinfo.value)
+
+
+def test_fiscal_year_for_accepts_a_valid_boundary_date(book):
+    # The fiscal year's own start date is an inclusive boundary; validation
+    # must not be so strict that it breaks this.
+    assert fiscal_year_for(book, "2026-01-01")["starts"] == "2026-01-01"
+
+
+def test_list_vouchers_rejects_an_unpadded_date_from(book):
+    with pytest.raises(DateFormatError):
+        list_vouchers(book, "2026-1-01", "2026-12-31")
+
+
+def test_list_vouchers_rejects_an_unpadded_date_to(book):
+    with pytest.raises(DateFormatError):
+        list_vouchers(book, "2026-01-01", "2026-12-1")
 
 
 def test_find_supplier_by_name_substring(book):

@@ -55,3 +55,7 @@ class AmountError(KitsasError):
 
 class AmbiguousSupplierError(KitsasError):
     pass
+
+
+class DateFormatError(KitsasError):
+    pass

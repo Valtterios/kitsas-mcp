@@ -4,6 +4,7 @@ import json
 from datetime import date
 
 from .constants import TILA_KIRJANPIDOSSA
+from .dates import parse_iso_date
 from .errors import NoFiscalYearError
 from .money import cents_to_euros
 
@@ -27,6 +28,7 @@ def list_fiscal_years(book) -> list[dict]:
 
 
 def fiscal_year_for(book, when: str) -> dict:
+    when = parse_iso_date(when, "when")
     for year in list_fiscal_years(book):
         if year["starts"] <= when <= year["ends"]:
             return year
@@ -49,6 +51,8 @@ def find_supplier(book, query: str) -> list[dict]:
 
 
 def list_vouchers(book, date_from, date_to, supplier=None, account=None, state=None) -> list[dict]:
+    date_from = parse_iso_date(date_from, "date_from")
+    date_to = parse_iso_date(date_to, "date_to")
     sql = [
         "SELECT t.id, t.pvm, t.tyyppi, t.tila, t.tunniste, t.otsikko, t.erapvm, k.nimi AS kumppani,",
         "       (SELECT max(coalesce(sum(debetsnt), 0), coalesce(sum(kreditsnt), 0)) "
