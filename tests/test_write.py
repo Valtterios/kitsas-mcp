@@ -582,20 +582,34 @@ def test_a_different_business_id_already_on_file_is_left_untouched(book):
     assert row["alvtunnus"] == "FI02454583", "an existing business id is pre-existing book data"
 
 
-def test_refuses_to_write_a_business_id_onto_a_partner_with_ledger_history(book):
-    """Hetzner has two ledger vouchers and no business id. This is not the place to add one."""
-    with pytest.raises(KitsasError) as excinfo:
-        add_purchase_invoice(book, **{**BILL, "supplier_name": "Hetzner", "business_id": "1234567-8"})
-    message = str(excinfo.value)
-    assert "Hetzner" in message
-    assert "1234567-8" in message
-    assert "Kitsas" in message
+def test_skips_the_business_id_on_a_partner_with_ledger_history_and_says_so(book):
+    """Hetzner has two ledger vouchers and no business id.
+
+    The invoice is still drafted: a Finnish invoice nearly always prints a
+    Y-tunnus, so refusing here would block every bill from a long-standing
+    supplier over a field the voucher does not depend on. The business id is
+    left alone and the skip is named in the summary instead of being silent.
+    """
+    result = add_purchase_invoice(
+        book, **{**BILL, "supplier_name": "Hetzner", "business_id": "1234567-8"}
+    )
+
+    voucher = get_voucher(book, result["voucher_id"])
+    assert voucher["state"] == 20
+    assert voucher["supplier"] == "Hetzner"
 
     with book.connect_read() as conn:
         row = conn.execute("SELECT alvtunnus FROM Kumppani WHERE id = 7").fetchone()
-        vouchers = conn.execute("SELECT count(*) FROM Tosite").fetchone()[0]
-    assert (row["alvtunnus"] or "") == ""
-    assert vouchers == 4, "the refusal must roll the whole transaction back"
+    assert (row["alvtunnus"] or "") == "", "an established partner keeps its own data"
+
+    summary = result["summary"]
+    assert "Left the business id unchanged on Hetzner" in summary
+    assert "set it in Kitsas" in summary
+
+
+def test_the_summary_is_silent_when_no_business_id_was_skipped(book):
+    result = add_purchase_invoice(book, **{**BILL, "business_id": "1234567-8"})
+    assert "business id" not in result["summary"]
 
 
 def test_a_partner_with_ledger_history_takes_an_invoice_without_a_business_id(book):

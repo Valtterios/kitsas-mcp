@@ -93,7 +93,7 @@ These are the invariants the code enforces, not just intentions:
 - Anything already in the ledger is read-only through this server. `delete_draft` refuses a voucher whose state has reached the ledger threshold, both before and again inside the write transaction, and no update statement it issues can touch such a voucher even on its own.
 - An IBAN already bound to one partner is never silently re-pointed to another. `add_purchase_invoice` refuses instead of overwriting the binding, naming who the IBAN currently belongs to.
 - An attachment over 20 MB is refused before it is even read from disk, so an oversized file is never copied into the book or into every future backup of it.
-- A business id read off an invoice is written onto an existing partner only when that partner has no business id yet and no vouchers in the ledger. A business id already on file is left alone, and a partner with ledger history is refused by name rather than corrected here, because a wrong value read from a scan would otherwise be undoable except by restoring a backup.
+- A business id read off an invoice is written onto an existing partner only when that partner has no business id yet and no vouchers in the ledger. One already on file is left alone, and so is a blank one on a partner that already has bookkeeping history: the draft is still written, and the summary names the partner that was left as it was, so the correction can be made in Kitsas. A wrong value read from a scan would otherwise be undoable except by restoring a backup.
 
 ### Backups accumulate
 

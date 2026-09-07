@@ -8,8 +8,10 @@ never does either, and never touches a voucher that is already in the ledger.
 Nothing outside the voucher being created is ever rewritten. A partner may be
 created, and a blank business id filled in on a partner that has no ledger
 history yet, but an existing IBAN binding is never re-pointed and neither a
-business id nor an IBAN on an established partner is ever overwritten: this
-module refuses instead.
+business id nor an IBAN on an established partner is ever overwritten. An IBAN
+that belongs elsewhere is refused; a business id on an established partner is
+left alone and reported in the summary, because the voucher does not depend on
+it and refusing would block the ordinary path.
 """
 
 import hashlib
@@ -184,15 +186,21 @@ def _bind_iban(conn, supplier_id: int, supplier_name: str, iban) -> None:
     )
 
 
-def _fill_blank_business_id(conn, supplier_id: int, name: str, business_id) -> None:
+def _fill_blank_business_id(conn, supplier_id: int, name: str, business_id) -> str | None:
     """Fill in a missing business id, but never on an established partner.
 
     A partner that already carries ledger vouchers is pre-existing book data:
-    its business id belongs on the invoices and reports those vouchers are
-    part of, and a business id read off a scanned invoice is only as good as
-    the scan. Writing one here would be undoable except by restoring a backup,
-    so this refuses and leaves the correction to Kitsas. A partner created by
-    this same call has no history to contradict, and is filled in freely.
+    its business id belongs on the invoices and reports those vouchers are part
+    of, and a business id read off a scanned invoice is only as good as the
+    scan. Writing one here would be undoable except by restoring a backup, so
+    this leaves the value alone and says so. A partner created by this same
+    call has no history to contradict, and is filled in freely.
+
+    Skipping rather than refusing is deliberate. A Finnish invoice nearly
+    always prints the supplier's Y-tunnus, so refusing would block the ordinary
+    path, every bill from a long-standing supplier, over a field the voucher
+    does not depend on. Returns a sentence for the caller's summary when the
+    write was skipped, so the skip is visible rather than silent.
 
     A partner that already has a non-blank alvtunnus is never touched at all,
     whatever its history: the WHERE clause carries that condition itself.
@@ -202,18 +210,20 @@ def _fill_blank_business_id(conn, supplier_id: int, name: str, business_id) -> N
         (supplier_id, TILA_KIRJANPIDOSSA),
     ).fetchone()[0]
     if booked:
-        raise KitsasError(
-            f"{name!r} already has {booked} voucher(s) in the ledger and no business id "
-            f"on file, so this will not write {business_id!r} onto it. Set the business id "
-            "on the partner in Kitsas, or leave business_id out of this call."
+        return (
+            f"Left the business id unchanged on {name}, which already has bookkeeping "
+            "history; set it in Kitsas if it needs updating."
         )
     conn.execute(
         "UPDATE Kumppani SET alvtunnus = ? WHERE id = ? AND coalesce(alvtunnus,'') = ''",
         (business_id, supplier_id),
     )
+    return None
 
 
-def _upsert_supplier(conn, name: str, business_id, iban) -> int:
+def _upsert_supplier(conn, name: str, business_id, iban) -> tuple[int, str | None]:
+    """Return the partner id, and a note for the summary if anything was skipped."""
+    note = None
     supplier_id = _find_supplier_id(conn, name)
     if supplier_id is None:
         cursor = conn.execute(
@@ -227,11 +237,11 @@ def _upsert_supplier(conn, name: str, business_id, iban) -> int:
             (supplier_id,),
         ).fetchone()
         if existing["alvtunnus"] == "":
-            _fill_blank_business_id(conn, supplier_id, name, business_id)
+            note = _fill_blank_business_id(conn, supplier_id, name, business_id)
 
     if iban:
         _bind_iban(conn, supplier_id, name, iban)
-    return supplier_id
+    return supplier_id, note
 
 
 def _attach(conn, voucher_id: int, attachment: tuple) -> dict:
@@ -321,7 +331,7 @@ def add_purchase_invoice(
     title = description or supplier_name
 
     with book.connect_write() as conn:
-        supplier_id = _upsert_supplier(conn, supplier_name, business_id, iban)
+        supplier_id, business_id_note = _upsert_supplier(conn, supplier_name, business_id, iban)
 
         cursor = conn.execute(
             TOSITE_INSERT,
@@ -394,6 +404,7 @@ def add_purchase_invoice(
             f"Draft voucher {voucher_id} for {supplier_name}, {cents_to_euros(total)} euros on "
             f"{booking_date}, credited to account {counter_account}. It is not in the ledger; "
             "open Kitsas to check and approve it."
+            + (f" {business_id_note}" if business_id_note else "")
         ),
     }
 
