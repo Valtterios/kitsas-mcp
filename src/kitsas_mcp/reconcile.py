@@ -1,0 +1,64 @@
+"""Checking the book's bank account against a real bank statement.
+
+Neither target book has ever imported a bank statement, so nothing has
+reconciled the ledger's bank account against the bank. Every automated bill
+asserts a payment; this is how a wrong one gets found.
+"""
+
+from .accounts import default_bank_account
+from .constants import TILA_KIRJANPIDOSSA
+from .money import cents_to_euros
+
+
+def _balance_cents(conn, account: int, on_date: str) -> int:
+    row = conn.execute(
+        "SELECT coalesce(sum(v.debetsnt), 0) - coalesce(sum(v.kreditsnt), 0) "
+        "FROM Vienti v JOIN Tosite t ON t.id = v.tosite "
+        "WHERE v.tili = ? AND v.pvm <= ? AND t.tila >= ?",
+        (account, on_date, TILA_KIRJANPIDOSSA),
+    ).fetchone()
+    return row[0] or 0
+
+
+def bank_balance(book, on_date: str, account=None) -> dict:
+    account = account if account is not None else default_bank_account(book)
+    with book.connect_read() as conn:
+        cents = _balance_cents(conn, account, on_date)
+    return {"account": account, "date": on_date, "balance": cents_to_euros(cents)}
+
+
+def bank_movements(book, date_from: str, date_to: str, account=None) -> list[dict]:
+    account = account if account is not None else default_bank_account(book)
+    with book.connect_read() as conn:
+        opening = _balance_cents(conn, account, _day_before(date_from))
+        rows = conn.execute(
+            "SELECT v.pvm, v.tosite, v.selite, v.debetsnt, v.kreditsnt, k.nimi AS kumppani "
+            "FROM Vienti v JOIN Tosite t ON t.id = v.tosite "
+            "LEFT JOIN Kumppani k ON k.id = v.kumppani "
+            "WHERE v.tili = ? AND v.pvm BETWEEN ? AND ? AND t.tila >= ? "
+            "ORDER BY v.pvm, v.tosite, v.rivi",
+            (account, date_from, date_to, TILA_KIRJANPIDOSSA),
+        ).fetchall()
+
+    running = opening
+    movements = []
+    for row in rows:
+        amount = (row["debetsnt"] or 0) - (row["kreditsnt"] or 0)
+        running += amount
+        movements.append(
+            {
+                "date": row["pvm"],
+                "voucher_id": row["tosite"],
+                "counterparty": row["kumppani"],
+                "description": row["selite"],
+                "amount": cents_to_euros(amount),
+                "running_balance": cents_to_euros(running),
+            }
+        )
+    return movements
+
+
+def _day_before(when: str) -> str:
+    from datetime import date, timedelta
+
+    return (date.fromisoformat(when) - timedelta(days=1)).isoformat()
