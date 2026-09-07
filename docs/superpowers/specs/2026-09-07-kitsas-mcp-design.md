@@ -216,6 +216,10 @@ find where they diverge. Read only.
 - Debits must equal credits, asserted before commit.
 - The booking date must fall inside an existing `Tilikausi`, or the write is
   refused. The server never creates a fiscal year.
+- The booking date must fall inside a fiscal year that is not confirmed.
+  `Tilikausi.json` carries `vahvistettu` once the financial statements are
+  confirmed; Fuusio has it on 2024 (2025-01-03) and 2025 (2026-04-28), leaving
+  only 2026 open. Writing into a confirmed year is refused.
 - All money is integer cents, converted by one audited function.
 - Writes are refused entirely on an unrecognised `KpVersio`.
 
