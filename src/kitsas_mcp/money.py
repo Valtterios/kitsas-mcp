@@ -17,14 +17,14 @@ def euros_to_cents(value) -> int:
     if isinstance(value, Decimal):
         amount = value
     else:
-        text = str(value).strip().replace(" ", "").replace(" ", "").replace(",", ".")
+        text = str(value).strip().replace(" ", "").replace("\xa0", "").replace(",", ".")
         try:
             amount = Decimal(text)
         except InvalidOperation:
-            raise AmountError(f"{value!r} is not an amount of money.") from None
+            raise AmountError(f"{value!r} is not an amount of money. Pass the amount as a string like '12.34'.") from None
 
     if amount != amount.quantize(CENTS):
-        raise AmountError(f"{value!r} has more precision than one cent.")
+        raise AmountError(f"{value!r} has more precision than one cent. Round it to two decimals first.")
 
     return int(amount.quantize(CENTS) * 100)
 

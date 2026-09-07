@@ -41,3 +41,13 @@ def test_non_numeric_is_rejected():
 @pytest.mark.parametrize("cents,expected", [(1234, "12.34"), (1, "0.01"), (0, "0.00"), (-500, "-5.00")])
 def test_cents_to_euros(cents, expected):
     assert cents_to_euros(cents) == expected
+
+
+def test_non_breaking_space_thousands_separator():
+    assert euros_to_cents("1\xa0234,56") == 123456
+
+
+def test_accepts_a_decimal():
+    from decimal import Decimal
+
+    assert euros_to_cents(Decimal("42.90")) == 4290
