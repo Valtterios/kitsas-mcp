@@ -300,3 +300,37 @@ def test_add_purchase_invoice_advertises_partner_id(book_path):
     assert "find_supplier" in description
     assert "do not match by name" in description
     assert "partner_id" not in TOOLS["add_purchase_invoice"]["required"]
+
+
+def test_add_purchase_invoice_advertises_confirm_new_partner(book_path):
+    """The other escape hatch: a name whose only rival differs in its accents.
+
+    The refusal names it, but a model that has never been told the argument
+    exists has no way to act on the half of the message that says the two
+    really are different suppliers.
+    """
+    schema = TOOLS["add_purchase_invoice"]["schema"]
+    assert schema["confirm_new_partner"]["type"] == "boolean"
+    assert "partner_id" in schema["confirm_new_partner"]["description"]
+    assert "confirm_new_partner" not in TOOLS["add_purchase_invoice"]["required"]
+
+
+def test_the_accent_refusal_reaches_the_client_as_an_error(book_path):
+    """Refused through the tool layer, not just as a Python exception."""
+    conn = sqlite3.connect(book_path)
+    conn.execute("INSERT INTO Kumppani (nimi, json) VALUES ('Kärkkäinen Lahti', '{}')")
+    conn.commit()
+    conn.close()
+
+    bill = {
+        "supplier_name": "Karkkainen",
+        "booking_date": "2026-05-04",
+        "lines": [{"account": 4000, "amount": "42.90"}],
+    }
+    refused = call_tool(book_path, "add_purchase_invoice", bill)
+    assert "accents" in refused["error"]
+    assert list(book_path.parent.glob("*.bak")) == []
+
+    written = call_tool(book_path, "add_purchase_invoice", {**bill, "confirm_new_partner": True})
+    assert "error" not in written
+    assert len(list(book_path.parent.glob("*.bak"))) == 1

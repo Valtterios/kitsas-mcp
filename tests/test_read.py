@@ -218,3 +218,32 @@ def test_find_supplier_still_matches_a_name_containing_a_backslash(book, book_pa
 def test_find_supplier_ignores_whitespace_around_the_query(book):
     """resolve_partner strips; find_supplier used not to, and found nothing."""
     assert [p["id"] for p in find_supplier(book, "  Hetzner  ")] == [7]
+
+
+# -- find_supplier matches on an IBAN, so it has to show them ----------------
+# It has always matched a query against the partners' IBANs, but returned only
+# the id, the name and the business id, so there was no way to see that the
+# IBAN on an invoice already belongs to a different partner until
+# add_purchase_invoice refused the bill over it.
+
+
+def test_find_supplier_returns_the_partners_ibans(book):
+    """Verohallinto is seeded with two IBANs; both come back with it."""
+    found = find_supplier(book, "Verohallinto")
+    assert [p["ibans"] for p in found] == [["FI5689199710000724", "FI6416603000117625"]]
+
+
+def test_a_partner_with_no_iban_gets_an_empty_list(book):
+    assert find_supplier(book, "Hetzner")[0]["ibans"] == []
+
+
+def test_searching_by_one_iban_still_shows_the_partners_other_ibans(book):
+    """The IBAN that matched must not be the only one reported.
+
+    Read off the join that the WHERE clause filters, a search for one of a
+    partner's IBANs would answer that the partner has exactly that one, which
+    is the opposite of what someone checking for a conflict needs to see.
+    """
+    found = find_supplier(book, "FI6416603000117625")
+    assert [p["id"] for p in found] == [1]
+    assert found[0]["ibans"] == ["FI5689199710000724", "FI6416603000117625"]

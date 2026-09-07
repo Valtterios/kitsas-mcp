@@ -30,7 +30,12 @@ TOOLS = {
         "handler": lambda book, args: read.list_fiscal_years(book),
     },
     "find_supplier": {
-        "description": "Find a partner by name, business id or IBAN.",
+        "description": (
+            "Find a partner by name, business id or IBAN. Returns each partner's id, name, "
+            "business id and IBANs. A name is matched with its accents ignored too, so "
+            "searching 'Karkkainen' shows a 'Karkkainen' spelled with umlauts if the book "
+            "has one. Check here before booking a bill for a supplier you have not seen."
+        ),
         "schema": {"query": {"type": "string"}},
         "required": ["query"],
         "handler": lambda book, args: read.find_supplier(book, args["query"]),
@@ -86,7 +91,10 @@ TOOLS = {
             "reuses that partner and says so in the summary; only a name that matches no "
             "partner creates one. A partner matched that way, by a substring of its name "
             "rather than by its own name, gets the voucher but keeps its own business id "
-            "and IBAN: use partner_id when you mean a partner outright."
+            "and IBAN: use partner_id when you mean a partner outright. A name that "
+            "matches no partner but that an existing partner resembles once accents are "
+            "ignored is refused rather than creating a duplicate: pass partner_id for the "
+            "existing partner, or confirm_new_partner to create the new one anyway."
         ),
         "schema": {
             "supplier_name": {"type": "string"},
@@ -97,6 +105,17 @@ TOOLS = {
             "booking_date": {"type": "string", "description": "YYYY-MM-DD, must be in an open fiscal year"},
             "business_id": {"type": "string"},
             "iban": {"type": "string"},
+            "confirm_new_partner": {
+                "type": "boolean",
+                "description": (
+                    "Create the supplier as a new partner even though the book already "
+                    "has one whose name differs from it only in accents. Only set this "
+                    "when they really are two different suppliers: in Finnish a and the "
+                    "letter written with two dots over it are different letters, so "
+                    "'Karkkainen' and the umlauted spelling can be two separate people. "
+                    "To book onto the existing partner instead, pass its partner_id."
+                ),
+            },
             "partner_id": {
                 "type": "integer",
                 "description": (

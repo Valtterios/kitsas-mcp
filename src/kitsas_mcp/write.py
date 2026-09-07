@@ -1,4 +1,4 @@
-"""The only module that changes a book. Drafts only, one transaction, after a backup.
+"""The only module that changes a book. Drafts only, one transaction, never without a backup.
 
 Everything written here lands at TILA_SAAPUNUT with no tunniste, which is what
 Kitsas calls an incoming, unapproved document. Kitsas itself moves the voucher
@@ -12,10 +12,18 @@ neither a business id nor an IBAN on an established partner is ever
 overwritten. A supplier name that already identifies a partner joins that
 partner rather than forking a second one beside it; the name is resolved by
 partners.py, the same rule suggest_account answers with, and a match on a name
-that is not the partner's own is named in the summary. An IBAN that belongs
-elsewhere is refused; a business id on an established partner is left alone and
-reported in the summary, because the voucher does not depend on it and refusing
-would block the ordinary path.
+that is not the partner's own is named in the summary. A name that matches no
+partner, but that a partner already in the book resembles once accents are
+ignored, is refused rather than quietly forking that partner in two;
+confirm_new_partner is how the caller says the two spellings really are two
+different suppliers. An IBAN that belongs elsewhere is refused; a business id
+on an established partner is left alone and reported in the summary, because
+the voucher does not depend on it and refusing would block the ordinary path.
+
+Every one of those refusals is reached on a read connection first, before the
+write transaction and so before the backup that opening one takes. The same
+checks run again inside the transaction, where they are what the write
+actually depends on.
 
 When the partner was found only by a substring of its name, the voucher is
 still written but the business id and the IBAN are not. The voucher is a
@@ -81,6 +89,16 @@ _NON_DELETABLE_STATE_NAMES = {
 AMBIGUITY_REMEDY = (
     "Pass partner_id to say which one you mean, use a name that matches exactly one "
     "of them, or merge them in Kitsas; find_supplier lists them with their ids."
+)
+
+# The ways out when the name matched nothing but a partner already in the book
+# differs from it only in its accents. Both have to be here: booking onto the
+# existing partner, and creating the new one anyway, because in Finnish the two
+# spellings really can be two different suppliers.
+NEAR_MATCH_REMEDY = (
+    "If it is the same supplier, pass partner_id to book onto the partner already in "
+    "the book; find_supplier lists the ids. If it really is a different supplier, pass "
+    "confirm_new_partner true to create it as a partner of its own beside that one."
 )
 
 # An invoice scan is a few hundred kilobytes. Anything past this is a wrong
@@ -281,12 +299,19 @@ def _named_partner_note(typed: str, matched: str) -> str | None:
     )
 
 
-def _bind_iban(conn, supplier_id: int, supplier_name: str, iban) -> None:
-    """Bind an IBAN to this partner. Never re-point one that belongs elsewhere.
+def _check_iban_free(conn, supplier_id, supplier_name: str, iban) -> bool:
+    """True when this IBAN still needs binding to this partner.
 
-    A KumppaniIban row is pre-existing book data outside the voucher being
-    written. Silently reassigning one would, for a single mistyped digit, move
-    the tax authority's bank account onto whatever supplier is being invoiced.
+    False when it is already bound to it, and a refusal when it belongs to
+    somebody else. A KumppaniIban row is pre-existing book data outside the
+    voucher being written. Silently reassigning one would, for a single
+    mistyped digit, move the tax authority's bank account onto whatever
+    supplier is being invoiced.
+
+    Split out from the binding itself so that the same question can be asked
+    on a read connection, before the book is copied for a write that this
+    would then refuse. `supplier_id` is None when the partner does not exist
+    yet, which no existing binding can belong to.
     """
     normalised = _normalise_iban(iban)
     owner = conn.execute(
@@ -295,18 +320,24 @@ def _bind_iban(conn, supplier_id: int, supplier_name: str, iban) -> None:
         (normalised,),
     ).fetchone()
 
-    if owner is not None:
-        if owner["kumppani"] == supplier_id:
-            return  # Already bound to this partner. Nothing to do.
-        raise KitsasError(
-            f"IBAN {normalised} already belongs to {owner['nimi']!r} in this book, not "
-            f"to {supplier_name!r}. Check the IBAN, or move it in Kitsas if it really "
-            "has changed hands."
-        )
-
-    conn.execute(
-        "INSERT INTO KumppaniIban (iban, kumppani) VALUES (?,?)", (normalised, supplier_id)
+    if owner is None:
+        return True
+    if supplier_id is not None and owner["kumppani"] == supplier_id:
+        return False  # Already bound to this partner. Nothing to do.
+    raise KitsasError(
+        f"IBAN {normalised} already belongs to {owner['nimi']!r} in this book, not "
+        f"to {supplier_name!r}. Check the IBAN, or move it in Kitsas if it really "
+        "has changed hands."
     )
+
+
+def _bind_iban(conn, supplier_id: int, supplier_name: str, iban) -> None:
+    """Bind an IBAN to this partner. Never re-point one that belongs elsewhere."""
+    if _check_iban_free(conn, supplier_id, supplier_name, iban):
+        conn.execute(
+            "INSERT INTO KumppaniIban (iban, kumppani) VALUES (?,?)",
+            (_normalise_iban(iban), supplier_id),
+        )
 
 
 def _fill_blank_business_id(conn, supplier_id: int, name: str, business_id) -> str | None:
@@ -344,8 +375,77 @@ def _fill_blank_business_id(conn, supplier_id: int, name: str, business_id) -> s
     return None
 
 
+# What the strings that mean "no" look like coming through JSON. Read as a
+# Python truth value, "false" is true, and taking it as consent would create
+# the very duplicate partner the resemblance refusal exists to prevent.
+_DENIALS = {"", "false", "0", "no"}
+_CONSENTS = {"true", "1", "yes"}
+
+
+def _confirmed(value) -> bool:
+    """confirm_new_partner as the boolean it is meant to be, or a refusal."""
+    if isinstance(value, str):
+        text = value.strip().casefold()
+        if text in _CONSENTS:
+            return True
+        if text in _DENIALS:
+            return False
+        raise LineFormatError(
+            f"confirm_new_partner is {value!r}, which is neither true nor false. Pass "
+            "true only to create a supplier as a new partner beside one whose name "
+            "differs from it only in accents, and leave it out otherwise."
+        )
+    return bool(value)
+
+
+def _plan_supplier(
+    conn, name: str, iban, partner_id=None, confirm_new_partner=False
+) -> tuple[PartnerMatch | None, list[str]]:
+    """Decide which partner this bill belongs to, deciding nothing else.
+
+    Every question here is answerable from a read connection, and every one of
+    them can refuse the call: an explicit partner_id that names no partner, a
+    name matching several partners, a name matching none but resembling one,
+    an IBAN that belongs to a different partner. add_purchase_invoice asks
+    them all before it opens the write transaction, so that a refusal costs no
+    backup, and _upsert_supplier asks them again inside the transaction, so
+    that no answer can go stale between the two.
+
+    Returns the partner the bill goes to, None when it is a supplier the book
+    does not have, and the sentences the caller's summary should carry.
+    """
+    notes = []
+    if partner_id is not None:
+        match = _partner_by_id(conn, partner_id)
+        named = _named_partner_note(name, match.name)
+        if named:
+            notes.append(named)
+    else:
+        match = resolve_partner(
+            conn,
+            name,
+            remedy=AMBIGUITY_REMEDY,
+            # None is how the caller says it has already been told that an
+            # existing partner resembles this name and that they are really
+            # two different suppliers.
+            near_remedy=None if _confirmed(confirm_new_partner) else NEAR_MATCH_REMEDY,
+        )
+
+    # Only checked where the binding would actually be attempted: a partner
+    # found by a substring of its name keeps its own IBAN either way, so an
+    # IBAN conflict is not that call's problem.
+    if iban and (match is None or match.exact):
+        _check_iban_free(
+            conn,
+            None if match is None else match.id,
+            name if match is None else match.name,
+            iban,
+        )
+    return match, notes
+
+
 def _upsert_supplier(
-    conn, name: str, business_id, iban, partner_id=None
+    conn, name: str, business_id, iban, partner_id=None, confirm_new_partner=False
 ) -> tuple[int, str, list[str]]:
     """Return the partner id, the name it is filed under, and notes for the summary.
 
@@ -362,15 +462,12 @@ def _upsert_supplier(
     sole trader "Nieminen" matches the member "Kari Nieminen", and it is that
     member's record that would otherwise take the supplier's IBAN and business
     id. Both are skipped and named in the summary instead.
+
+    Which partner it is, is decided by _plan_supplier, which
+    add_purchase_invoice has already run once on a read connection. Running it
+    again here is the guard against anything having changed in between.
     """
-    notes = []
-    if partner_id is not None:
-        match = _partner_by_id(conn, partner_id)
-        named = _named_partner_note(name, match.name)
-        if named:
-            notes.append(named)
-    else:
-        match = resolve_partner(conn, name, remedy=AMBIGUITY_REMEDY)
+    match, notes = _plan_supplier(conn, name, iban, partner_id, confirm_new_partner)
 
     if match is None:
         cursor = conn.execute(
@@ -464,6 +561,7 @@ def add_purchase_invoice(
     business_id=None,
     iban=None,
     partner_id=None,
+    confirm_new_partner=False,
     invoice_date=None,
     due_date=None,
     reference=None,
@@ -476,6 +574,13 @@ def add_purchase_invoice(
     partner_id, when given, names the partner outright: no name matching of
     any kind happens, the partner must exist, and supplier_name is then only
     the text that goes on the voucher.
+
+    confirm_new_partner answers the one refusal that has no other way out: a
+    supplier name that matches no partner but that an existing partner
+    resembles once accents are ignored. It creates the new partner anyway, for
+    when the two spellings really are two different suppliers. It does not
+    create a duplicate of a partner the name does match, exactly or by a
+    substring; those still join the partner that is already there.
     """
     # booking_date is validated here rather than only inside
     # _check_fiscal_year, whose own parse was a side effect: the raw value
@@ -521,9 +626,19 @@ def add_purchase_invoice(
     attachment_source = _read_attachment(pdf_path) if pdf_path else None
     title = description or supplier_name
 
+    # Everything about the partner that can be judged without writing is
+    # judged here, on a read connection. Each of these refusals used to happen
+    # inside the write transaction, which connect_write opens only after
+    # copying the whole book: the trial that found this refused 19 calls
+    # against a 114 MB book and paid 2.1 GB of backups for writes that never
+    # happened. _upsert_supplier asks the same questions again inside the
+    # transaction, where the answers are the ones the write depends on.
+    with book.connect_read() as conn:
+        _plan_supplier(conn, supplier_name, iban, partner_id, confirm_new_partner)
+
     with book.connect_write() as conn:
         supplier_id, filed_as, supplier_notes = _upsert_supplier(
-            conn, supplier_name, business_id, iban, partner_id
+            conn, supplier_name, business_id, iban, partner_id, confirm_new_partner
         )
 
         cursor = conn.execute(
@@ -590,6 +705,11 @@ def add_purchase_invoice(
             ),
         )
 
+    # The same copy every write in this session is protected by, not one taken
+    # for this bill: see Book.backup. Named in the summary in those words,
+    # because "backup taken" reads as a snapshot from a moment ago.
+    backup_path = book.backup()
+
     return {
         "voucher_id": voucher_id,
         # The partner the voucher is actually attached to, which is not always
@@ -600,12 +720,15 @@ def add_purchase_invoice(
         "credit_account": counter_account,
         "lines": [{"account": a, "amount": cents_to_euros(c)} for a, c, _ in prepared],
         "attachment": attachment,
-        "backup": str(book.backup()),
+        "backup": str(backup_path),
         "summary": (
             f"Draft voucher {voucher_id} for {supplier_name}, {cents_to_euros(total)} euros on "
             f"{booking_date}, credited to account {counter_account}. It is not in the ledger; "
             "open Kitsas to check and approve it."
             + "".join(f" {note}" for note in supplier_notes)
+            + f" The backup {backup_path.name} holds the book as it stood before the first "
+            "write of this session, not before this bill: anything entered since is in the "
+            "book but not in that copy. Use delete_draft to undo this draft."
         ),
     }
 

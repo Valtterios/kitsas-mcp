@@ -247,6 +247,7 @@ def test_a_locked_book_is_still_reported_as_locked(book_path):
 
 
 def test_two_backups_in_immediate_succession_do_not_collide(book_path):
+    """Two sessions, not two writes: within one session there is one backup."""
     first = Book(book_path).backup()
 
     conn = sqlite3.connect(book_path)
@@ -254,6 +255,7 @@ def test_two_backups_in_immediate_succession_do_not_collide(book_path):
     conn.commit()
     conn.close()
 
+    db.forget_session_backups()
     second = Book(book_path).backup()
 
     assert first != second
@@ -278,6 +280,7 @@ def test_backup_picks_the_next_free_name_when_the_stamp_repeats(book_path, monke
     monkeypatch.setattr(db, "datetime", FrozenClock)
 
     first = Book(book_path).backup()
+    db.forget_session_backups()
     second = Book(book_path).backup()
 
     assert first != second
@@ -388,9 +391,13 @@ def test_backup_gives_up_after_max_attempts_rather_than_overwriting(book_path, m
     monkeypatch.setattr(db, "datetime", FrozenClock)
     monkeypatch.setattr(db, "MAX_BACKUP_ATTEMPTS", 2)
 
-    taken = [Book(book_path).backup(), Book(book_path).backup()]
+    taken = []
+    for _ in range(2):
+        db.forget_session_backups()
+        taken.append(Book(book_path).backup())
     assert len(set(taken)) == 2
 
+    db.forget_session_backups()
     with pytest.raises(BackupError) as excinfo:
         Book(book_path).backup()
     message = str(excinfo.value)
@@ -414,6 +421,9 @@ def test_a_write_is_refused_when_no_backup_name_is_free(book_path, monkeypatch):
     monkeypatch.setattr(db, "datetime", FrozenClock)
     monkeypatch.setattr(db, "MAX_BACKUP_ATTEMPTS", 1)
     Book(book_path).backup()
+    # An earlier session's backup: this session has none of its own, and the
+    # one free name is taken, so its write cannot be protected at all.
+    db.forget_session_backups()
 
     before = book_path.read_bytes()
     with pytest.raises(BackupError):

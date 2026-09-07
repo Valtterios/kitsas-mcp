@@ -1,3 +1,4 @@
+import shutil
 import sqlite3
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from kitsas_mcp.errors import (
     LineFormatError,
     NoFiscalYearError,
     PartnerNotFoundError,
+    SimilarPartnerError,
     UnbalancedVoucherError,
 )
 from kitsas_mcp.read import get_voucher
@@ -1049,3 +1051,183 @@ def test_the_booking_date_bound_into_sql_is_the_normalised_one(book):
         }
     assert header["pvm"] == "2026-05-04"
     assert dates == {"2026-05-04"}
+
+
+# -- A refused write costs no backup, and a session takes only one -----------
+# connect_write copies the whole book before it opens the transaction, so
+# every check made inside the transaction used to be paid for with a full
+# copy first. The trial that found this refused 19 calls against a 114 MB
+# book and left 2.1 GB of .bak files behind for writes that never happened.
+# Two things fix it: everything checkable on a read connection is checked
+# before the copy, and a copy taken for a write that then rolled back with
+# nothing behind it is removed again.
+
+
+def baks(book_path):
+    return sorted(book_path.parent.glob("*.bak"))
+
+
+def _seed_two_partners(book_path):
+    """A partner to be ambiguous against, and one whose umlauts can be dropped."""
+    _add_member(book_path, "Hetzner Cloud")
+    return _add_member(book_path, "Kärkkäinen Lahti")
+
+
+@pytest.mark.parametrize(
+    "bill, error",
+    [
+        pytest.param({"partner_id": 4242}, PartnerNotFoundError, id="partner_id"),
+        pytest.param(
+            {"iban": "FI56 8919 9710 000724"}, KitsasError, id="iban_belongs_elsewhere"
+        ),
+        pytest.param({"supplier_name": "etzner"}, AmbiguousSupplierError, id="ambiguous_name"),
+        pytest.param({"supplier_name": "Karkkainen"}, SimilarPartnerError, id="dropped_umlauts"),
+    ],
+)
+def test_a_refused_write_leaves_no_backup_behind(book, book_path, bill, error):
+    _seed_two_partners(book_path)
+    before = book_path.read_bytes()
+
+    with pytest.raises(error):
+        add_purchase_invoice(book, **{**BILL, **bill})
+
+    assert baks(book_path) == [], "a knowable refusal must not copy the book first"
+    assert book_path.read_bytes() == before
+
+
+def test_a_successful_write_leaves_exactly_one_backup(book, book_path):
+    add_purchase_invoice(book, **BILL)
+    assert len(baks(book_path)) == 1
+
+
+def test_a_second_write_in_the_same_session_takes_no_second_backup(book_path):
+    """One backup per book per process: the server builds a Book per call."""
+    from kitsas_mcp.db import Book
+
+    first = add_purchase_invoice(Book(book_path), **BILL)
+    second = add_purchase_invoice(Book(book_path), **BILL)
+
+    assert first["backup"] == second["backup"]
+    assert len(baks(book_path)) == 1
+    assert first["voucher_id"] != second["voucher_id"], "both bills were really written"
+
+
+def test_two_books_in_one_session_get_a_backup_each(book_path, tmp_path):
+    from kitsas_mcp.db import Book
+
+    other_path = tmp_path / "toinen" / book_path.name
+    other_path.parent.mkdir()
+    shutil.copy2(book_path, other_path)
+
+    first = add_purchase_invoice(Book(book_path), **BILL)
+    second = add_purchase_invoice(Book(other_path), **BILL)
+
+    assert first["backup"] != second["backup"]
+    assert len(baks(book_path)) == 1 and len(baks(other_path)) == 1
+
+
+def test_the_summary_says_the_backup_predates_the_session_not_the_bill(book_path):
+    from kitsas_mcp.db import Book
+
+    add_purchase_invoice(Book(book_path), **BILL)
+    summary = add_purchase_invoice(Book(book_path), **BILL)["summary"]
+    assert "before the first write of this session" in summary
+    assert "not before this bill" in summary
+
+
+def _break_the_voucher_insert(monkeypatch):
+    """Make the readback fail inside the transaction, after rows were written.
+
+    A failure the write transaction alone can see, which is what the backup
+    cleanup is for: everything checkable earlier is already checked earlier.
+    """
+    monkeypatch.setattr(
+        write_module,
+        "TOSITE_INSERT",
+        "INSERT INTO Tosite (pvm, tyyppi, sarja, tunniste, otsikko, kumppani, laskupvm, "
+        "erapvm, viite, json) VALUES (?,?,?,NULL,?,?,?,?,?,'{}')",
+    )
+
+
+def test_a_rolled_back_write_takes_its_backup_away_with_it(book, book_path, monkeypatch):
+    before = book_path.read_bytes()
+    _break_the_voucher_insert(monkeypatch)
+
+    with pytest.raises(LedgerVoucherError):
+        add_purchase_invoice(book, **BILL)
+
+    assert baks(book_path) == [], "the copy protected a write that did not happen"
+    assert book_path.read_bytes() == before
+
+
+def test_the_session_backup_survives_a_rollback_after_a_successful_write(book_path, monkeypatch):
+    """The one thing the cleanup must never do: delete a real write's only snapshot."""
+    from kitsas_mcp.db import Book
+
+    written = add_purchase_invoice(Book(book_path), **BILL)
+    backup = Path(written["backup"])
+
+    _break_the_voucher_insert(monkeypatch)
+    with pytest.raises(LedgerVoucherError):
+        add_purchase_invoice(Book(book_path), **BILL)
+
+    assert backup.exists(), "the backup is the only copy of the book before that draft"
+    assert baks(book_path) == [backup]
+
+    # And it really is the pre-write state, so the draft can still be recovered from.
+    with Book(backup).connect_read() as conn:
+        assert conn.execute("SELECT count(*) FROM Tosite").fetchone()[0] == 4
+
+
+def test_a_write_after_a_discarded_backup_takes_a_fresh_one(book, book_path, monkeypatch):
+    """No write may proceed on the strength of a backup that is no longer there."""
+    _break_the_voucher_insert(monkeypatch)
+    with pytest.raises(LedgerVoucherError):
+        add_purchase_invoice(book, **BILL)
+    assert baks(book_path) == []
+
+    monkeypatch.undo()
+    result = add_purchase_invoice(book, **BILL)
+    assert baks(book_path) == [Path(result["backup"])]
+
+
+def test_a_backup_deleted_by_hand_is_taken_again(book_path):
+    from kitsas_mcp.db import Book
+
+    first = Path(add_purchase_invoice(Book(book_path), **BILL)["backup"])
+    first.unlink()
+
+    second = Path(add_purchase_invoice(Book(book_path), **BILL)["backup"])
+    assert second != first and second.exists()
+
+
+@pytest.mark.parametrize("value", [False, "false", "False", "", None, 0])
+def test_a_confirm_new_partner_that_is_not_consent_does_not_create_a_partner(
+    book, book_path, value
+):
+    """"false" is a true string in Python, and this is the one place that matters."""
+    _add_member(book_path, "Kärkkäinen Lahti")
+
+    with pytest.raises(SimilarPartnerError):
+        add_purchase_invoice(
+            book, **{**BILL, "supplier_name": "Karkkainen", "confirm_new_partner": value}
+        )
+
+
+@pytest.mark.parametrize("value", [True, "true", "True"])
+def test_a_confirm_new_partner_that_is_consent_creates_the_partner(book, book_path, value):
+    _add_member(book_path, "Kärkkäinen Lahti")
+    result = add_purchase_invoice(
+        book, **{**BILL, "supplier_name": "Karkkainen", "confirm_new_partner": value}
+    )
+    assert result["supplier"] == "Karkkainen"
+
+
+def test_a_confirm_new_partner_that_is_neither_is_refused_by_name(book, book_path):
+    _add_member(book_path, "Kärkkäinen Lahti")
+    with pytest.raises(LineFormatError) as excinfo:
+        add_purchase_invoice(
+            book, **{**BILL, "supplier_name": "Karkkainen", "confirm_new_partner": "maybe"}
+        )
+    assert "confirm_new_partner" in str(excinfo.value)
+    assert list(book_path.parent.glob("*.bak")) == []

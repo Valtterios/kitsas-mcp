@@ -100,6 +100,22 @@ def _build(path: Path) -> None:
     conn.close()
 
 
+@pytest.fixture(autouse=True)
+def fresh_session():
+    """Every test is its own server session, so no test inherits another's backup.
+
+    A backup is taken once per book per process, so without this the second
+    test to write to a book would reuse the first test's backup the way a
+    second bill in one server session does, and the tests that count .bak
+    files would count the wrong session's.
+    """
+    from kitsas_mcp.db import forget_session_backups
+
+    forget_session_backups()
+    yield
+    forget_session_backups()
+
+
 @pytest.fixture
 def book_path(tmp_path) -> Path:
     path = tmp_path / "testi.kitsas"
