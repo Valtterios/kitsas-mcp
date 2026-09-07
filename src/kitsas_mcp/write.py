@@ -23,11 +23,16 @@ import json
 import mimetypes
 from pathlib import Path
 
-from .accounts import default_bank_account, get_account
+from .accounts import account_by_number, default_bank_account_of, list_accounts
 from .constants import (
+    TILA_HYLATTY,
+    TILA_HYVAKSYTTY,
     TILA_KIRJANPIDOSSA,
+    TILA_LUONNOS,
+    TILA_MALLIPOHJA,
     TILA_POISTETTU,
     TILA_SAAPUNUT,
+    TILA_TARKASTETTU,
     TOSITE_MENO,
     VIENTI_OSTO_KIRJAUS,
     VIENTI_OSTO_VASTAKIRJAUS,
@@ -43,7 +48,25 @@ from .errors import (
 )
 from .money import cents_to_euros, euros_to_cents
 from .partners import resolve_partner
-from .read import fiscal_year_for
+from .read import FISCAL_YEAR_CONFIRMED_UNKNOWN, fiscal_year_for, no_such_voucher_error
+
+# The voucher states delete_draft is actually meant for: a document waiting
+# in the inbox, one that has been checked or accepted but not yet booked, and
+# a plain draft. Deliberately excludes TILA_MALLIPOHJA (a saved voucher
+# template) and TILA_HYLATTY (a rejected document): both sit below the
+# TILA_KIRJANPIDOSSA ledger threshold, so the old "anything below the
+# threshold" guard let delete_draft mark either one deleted, which for a
+# template is recoverable only from a .bak.
+DELETABLE_STATES = frozenset({TILA_SAAPUNUT, TILA_TARKASTETTU, TILA_HYVAKSYTTY, TILA_LUONNOS})
+
+# Plain-language names for the states below the ledger threshold that
+# delete_draft still refuses, so the error can name what the voucher actually
+# is rather than just its number.
+_NON_DELETABLE_STATE_NAMES = {
+    TILA_POISTETTU: "already deleted",
+    TILA_MALLIPOHJA: "a voucher template Kitsas keeps for reuse",
+    TILA_HYLATTY: "a rejected document",
+}
 
 # add_purchase_invoice takes a supplier name and no partner id, so the way out
 # of an ambiguity here is a name the book matches only once.
@@ -66,6 +89,17 @@ TOSITE_INSERT = (
 
 def _check_fiscal_year(book, booking_date: str) -> None:
     year = fiscal_year_for(book, booking_date)
+    if year["confirmed"] == FISCAL_YEAR_CONFIRMED_UNKNOWN:
+        # Whether this year was confirmed cannot be read at all (Tilikausi.json
+        # is corrupt). Refusing is the safe direction: reporting it as
+        # unconfirmed instead would let a write through a year that might
+        # really be closed, and there would be no way to notice.
+        raise ClosedFiscalYearError(
+            f"The fiscal year {year['starts']} to {year['ends']} has unreadable data in "
+            "this book, so whether it has been confirmed cannot be determined. Nothing "
+            "may be added to it until that is known, in case it is really closed. Open "
+            "the book in Kitsas, which will rewrite the year's data, then try again."
+        )
     if year["confirmed"]:
         raise ClosedFiscalYearError(
             f"The fiscal year {year['starts']} to {year['ends']} was confirmed on "
@@ -74,8 +108,8 @@ def _check_fiscal_year(book, booking_date: str) -> None:
         )
 
 
-def _prepare_lines(book, lines, description, supplier_name) -> list[tuple]:
-    """Validate every line before any connection is opened for writing."""
+def _prepare_lines(accounts, lines, description, supplier_name) -> list[tuple]:
+    """Validate every line against a chart of accounts already loaded once."""
     if not lines:
         raise UnbalancedVoucherError(
             "A bill needs at least one expense line. Pass lines as, for example, "
@@ -98,7 +132,7 @@ def _prepare_lines(book, lines, description, supplier_name) -> list[tuple]:
                 "string like '42.90'."
             )
 
-        get_account(book, account)  # raises AccountNotFoundError
+        account_by_number(accounts, account)  # raises AccountNotFoundError
         cents = euros_to_cents(line["amount"])  # raises AmountError
         if cents <= 0:
             raise AmountError(
@@ -344,11 +378,21 @@ def add_purchase_invoice(
     if due_date is not None:
         due_date = parse_iso_date(due_date, "due_date")
 
-    prepared = _prepare_lines(book, lines, description, supplier_name)
+    # Loaded once and validated against in memory: a five-line bill used to
+    # open a fresh connection per get_account call plus one more for the
+    # default bank account, all before the write transaction even opened.
+    accounts = list_accounts(book)
+
+    prepared = _prepare_lines(accounts, lines, description, supplier_name)
     total = sum(cents for _, cents, _ in prepared)
 
-    counter_account = credit_account if credit_account is not None else default_bank_account(book)
-    get_account(book, counter_account)
+    if credit_account is None:
+        # Already validated by construction: default_bank_account_of only
+        # ever returns a number that is in `accounts`.
+        counter_account = default_bank_account_of(accounts)
+    else:
+        account_by_number(accounts, credit_account)  # raises AccountNotFoundError
+        counter_account = credit_account
 
     attachment_source = _read_attachment(pdf_path) if pdf_path else None
     title = description or supplier_name
@@ -442,18 +486,28 @@ def add_purchase_invoice(
     }
 
 
+def _describe_state(tila: int) -> str:
+    """A plain-language name for a state delete_draft refuses to touch."""
+    return _NON_DELETABLE_STATE_NAMES.get(tila, f"in state {tila}, which delete_draft does not handle")
+
+
 def _check_deletable(conn, voucher_id: int) -> None:
     row = conn.execute("SELECT tila FROM Tosite WHERE id = ?", (voucher_id,)).fetchone()
     if row is None:
-        raise LedgerVoucherError(
-            f"There is no voucher {voucher_id} in this book. "
-            "Use list_vouchers to find the id of the voucher you meant."
-        )
-    if row["tila"] >= TILA_KIRJANPIDOSSA:
+        raise no_such_voucher_error(voucher_id)
+    tila = row["tila"]
+    if tila >= TILA_KIRJANPIDOSSA:
         raise LedgerVoucherError(
             f"Voucher {voucher_id} is already in the ledger and cannot be deleted here. "
             "Booked history is read-only through this server; do it in Kitsas if you "
             "really mean to."
+        )
+    if tila not in DELETABLE_STATES:
+        raise LedgerVoucherError(
+            f"Voucher {voucher_id} is {_describe_state(tila)}, not a document waiting in "
+            "its inbox or a draft someone is still working on. Only those "
+            f"(states {sorted(DELETABLE_STATES)}) can be deleted here; manage this "
+            "voucher in Kitsas directly instead."
         )
 
 

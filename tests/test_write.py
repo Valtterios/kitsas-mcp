@@ -4,6 +4,13 @@ from pathlib import Path
 import pytest
 
 from kitsas_mcp import write as write_module
+from kitsas_mcp.constants import (
+    TILA_HYLATTY,
+    TILA_HYVAKSYTTY,
+    TILA_MALLIPOHJA,
+    TILA_POISTETTU,
+    TILA_TARKASTETTU,
+)
 from kitsas_mcp.errors import (
     AccountNotFoundError,
     AmbiguousSupplierError,
@@ -157,6 +164,28 @@ def test_refuses_a_confirmed_fiscal_year(book):
     assert "confirmed" in str(excinfo.value)
 
 
+def test_refuses_a_booking_into_a_fiscal_year_with_unreadable_data(book, book_path):
+    """Finding 1's write-path case: list_fiscal_years is reached from add_purchase_invoice
+    via fiscal_year_for -> _check_fiscal_year. Before the fix, a Tilikausi row with
+    malformed json escaped this whole call as a bare json.JSONDecodeError instead of a
+    KitsasError; the confirmation status of a year that cannot be read must refuse the
+    write rather than let it through as if the year were open, since None would.
+    """
+    conn = sqlite3.connect(book_path)
+    conn.execute(
+        "INSERT INTO Tilikausi (alkaa, loppuu, json) VALUES (?,?,?)",
+        ("2027-01-01", "2027-12-31", "{not valid json"),
+    )
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(ClosedFiscalYearError) as excinfo:
+        add_purchase_invoice(book, **{**BILL, "booking_date": "2027-06-15"})
+    message = str(excinfo.value)
+    assert "2027-01-01" in message and "2027-12-31" in message
+    assert "cannot be determined" in message
+
+
 def test_refuses_an_unknown_account(book):
     with pytest.raises(AccountNotFoundError):
         add_purchase_invoice(book, **{**BILL, "lines": [{"account": 9999, "amount": "1.00"}]})
@@ -252,6 +281,76 @@ def test_delete_draft_refuses_a_voucher_that_does_not_exist(book):
 def test_delete_draft_accepts_the_other_draft_state(book):
     delete_draft(book, 4)
     assert get_voucher(book, 4)["state"] == 0
+
+
+# -- Finding 3: delete_draft is narrowed to the states it is actually meant for --
+# (inbox, checked, accepted, draft) and refuses templates, rejected documents,
+# already-deleted vouchers and anything in the ledger, naming the state and the fix.
+
+
+def _insert_tosite(book_path, voucher_id, tila):
+    """A bare Tosite row in a given state, with no Vienti rows of its own.
+
+    delete_draft's guard only ever reads Tosite.tila, so nothing else is
+    needed to exercise it.
+    """
+    conn = sqlite3.connect(book_path)
+    conn.execute(
+        "INSERT INTO Tosite (id, pvm, tyyppi, tila, tunniste, otsikko, kumppani, laskupvm) "
+        "VALUES (?, '2026-06-01', 100, ?, NULL, 'Test', 7, '2026-06-01')",
+        (voucher_id, tila),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_delete_draft_refuses_a_voucher_template(book, book_path):
+    """A saved Kitsas voucher template (tila=5) is not a draft.
+
+    The old guard was "anything below the ledger threshold", which swept up
+    MALLIPOHJA templates too. Marking one deleted here would make it vanish
+    from Kitsas, recoverable only from a .bak.
+    """
+    _insert_tosite(book_path, 5, TILA_MALLIPOHJA)
+
+    with pytest.raises(LedgerVoucherError) as excinfo:
+        delete_draft(book, 5)
+    message = str(excinfo.value)
+    assert "template" in message
+    assert "5" in message
+    assert get_voucher(book, 5)["state"] == TILA_MALLIPOHJA
+
+
+def test_delete_draft_refuses_a_rejected_document(book, book_path):
+    _insert_tosite(book_path, 6, TILA_HYLATTY)
+
+    with pytest.raises(LedgerVoucherError) as excinfo:
+        delete_draft(book, 6)
+    assert "rejected" in str(excinfo.value)
+    assert get_voucher(book, 6)["state"] == TILA_HYLATTY
+
+
+def test_delete_draft_refuses_a_voucher_that_is_already_deleted(book, book_path):
+    _insert_tosite(book_path, 7, TILA_POISTETTU)
+
+    with pytest.raises(LedgerVoucherError) as excinfo:
+        delete_draft(book, 7)
+    assert "already deleted" in str(excinfo.value)
+    assert get_voucher(book, 7)["state"] == TILA_POISTETTU
+
+
+def test_delete_draft_accepts_a_checked_document(book, book_path):
+    _insert_tosite(book_path, 8, TILA_TARKASTETTU)
+
+    delete_draft(book, 8)
+    assert get_voucher(book, 8)["state"] == TILA_POISTETTU
+
+
+def test_delete_draft_accepts_an_accepted_document(book, book_path):
+    _insert_tosite(book_path, 9, TILA_HYVAKSYTTY)
+
+    delete_draft(book, 9)
+    assert get_voucher(book, 9)["state"] == TILA_POISTETTU
 
 
 def test_writes_the_audit_log(book):

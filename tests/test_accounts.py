@@ -56,6 +56,48 @@ def test_list_accounts_with_malformed_json(book):
     assert malformed["type"] == "DZ"
 
 
+# -- Finding 2: valid JSON that is not the object shape expected -------------
+
+
+def test_list_accounts_with_json_null(book):
+    """json = 'null' parses without error, but data.get('nimi') on None raises AttributeError."""
+    with book.connect_write() as conn:
+        conn.execute(
+            "INSERT INTO Tili (numero, tyyppi, json) VALUES (?,?,?)",
+            (5001, "DZ", "null"),
+        )
+    accounts = list_accounts(book)
+    account = [a for a in accounts if a["number"] == 5001][0]
+    assert account["name"] == ""
+    assert account["type"] == "DZ"
+
+
+def test_list_accounts_with_json_list(book):
+    """A JSON array is valid JSON but not a dict either."""
+    with book.connect_write() as conn:
+        conn.execute(
+            "INSERT INTO Tili (numero, tyyppi, json) VALUES (?,?,?)",
+            (5002, "DZ", "[1, 2, 3]"),
+        )
+    accounts = list_accounts(book)
+    account = [a for a in accounts if a["number"] == 5002][0]
+    assert account["name"] == ""
+    assert account["type"] == "DZ"
+
+
+def test_list_accounts_with_nimi_as_a_plain_string(book):
+    """'nimi' is supposed to be {'fi': ..., 'sv': ...}; a bare string would make names.get('fi') raise."""
+    with book.connect_write() as conn:
+        conn.execute(
+            "INSERT INTO Tili (numero, tyyppi, json) VALUES (?,?,?)",
+            (5003, "DZ", json.dumps({"nimi": "just a string"})),
+        )
+    accounts = list_accounts(book)
+    account = [a for a in accounts if a["number"] == 5003][0]
+    assert account["name"] == ""
+    assert account["type"] == "DZ"
+
+
 def test_number_search_uses_prefix_matching(book):
     """Number search should match prefixes, not substrings."""
     with book.connect_write() as conn:

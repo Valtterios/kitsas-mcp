@@ -1,7 +1,14 @@
 import pytest
 
-from kitsas_mcp.errors import DateFormatError, NoFiscalYearError
-from kitsas_mcp.read import find_supplier, fiscal_year_for, get_voucher, list_fiscal_years, list_vouchers
+from kitsas_mcp.errors import DateFormatError, LedgerVoucherError, NoFiscalYearError
+from kitsas_mcp.read import (
+    FISCAL_YEAR_CONFIRMED_UNKNOWN,
+    find_supplier,
+    fiscal_year_for,
+    get_voucher,
+    list_fiscal_years,
+    list_vouchers,
+)
 
 
 def test_lists_fiscal_years_and_marks_the_confirmed_one(book):
@@ -9,6 +16,58 @@ def test_lists_fiscal_years_and_marks_the_confirmed_one(book):
     assert [y["starts"] for y in years] == ["2025-01-01", "2026-01-01"]
     assert years[0]["confirmed"] == "2026-04-28"
     assert years[1]["confirmed"] is None
+
+
+# -- Finding 1: malformed Tilikausi.json must not crash list_fiscal_years ----
+
+
+def test_list_fiscal_years_survives_malformed_json(book):
+    """A Tilikausi row with unreadable json must still list, dates intact.
+
+    Before the fix, list_fiscal_years called json.loads(row["json"] or "{}")
+    unguarded, so this row raised a bare json.JSONDecodeError, and because
+    list_fiscal_years is on add_purchase_invoice's write path (via
+    fiscal_year_for -> _check_fiscal_year), a bill could not even be booked
+    into an unrelated, perfectly good fiscal year without tripping over it.
+    """
+    with book.connect_write() as conn:
+        conn.execute(
+            "INSERT INTO Tilikausi (alkaa, loppuu, json) VALUES (?,?,?)",
+            ("2027-01-01", "2027-12-31", "{not valid json"),
+        )
+
+    years = list_fiscal_years(book)
+    assert [y["starts"] for y in years] == ["2025-01-01", "2026-01-01", "2027-01-01"]
+    broken = years[2]
+    assert broken["ends"] == "2027-12-31"
+    # Unknown, not None: None would read as "not confirmed" and let a write
+    # through a year that might really be closed. See the module docstring
+    # on FISCAL_YEAR_CONFIRMED_UNKNOWN for the full reasoning.
+    assert broken["confirmed"] == FISCAL_YEAR_CONFIRMED_UNKNOWN
+    assert bool(broken["confirmed"]) is True
+
+
+def test_list_fiscal_years_treats_valid_non_object_json_the_same_as_unreadable(book):
+    """json = 'null' parses without error but is not a dict; .get('vahvistettu') would raise."""
+    with book.connect_write() as conn:
+        conn.execute(
+            "INSERT INTO Tilikausi (alkaa, loppuu, json) VALUES (?,?,?)",
+            ("2027-01-01", "2027-12-31", "null"),
+        )
+
+    years = list_fiscal_years(book)
+    assert years[2]["confirmed"] == FISCAL_YEAR_CONFIRMED_UNKNOWN
+
+
+def test_fiscal_year_for_reports_the_unknown_sentinel_for_a_corrupt_year(book):
+    with book.connect_write() as conn:
+        conn.execute(
+            "INSERT INTO Tilikausi (alkaa, loppuu, json) VALUES (?,?,?)",
+            ("2027-01-01", "2027-12-31", "{broken"),
+        )
+
+    year = fiscal_year_for(book, "2027-06-15")
+    assert year["confirmed"] == FISCAL_YEAR_CONFIRMED_UNKNOWN
 
 
 def test_fiscal_year_for_a_date_inside_a_year(book):
@@ -101,8 +160,13 @@ def test_get_voucher_returns_header_and_entries(book):
     assert credit["credit"] == "47.31"
 
 
-def test_get_voucher_returns_none_for_a_missing_id(book):
-    assert get_voucher(book, 4242) is None
+def test_get_voucher_raises_for_a_missing_id(book):
+    """Every sibling read raises a KitsasError; a bare None answered a wrong id silently."""
+    with pytest.raises(LedgerVoucherError) as excinfo:
+        get_voucher(book, 4242)
+    message = str(excinfo.value)
+    assert "4242" in message
+    assert "list_vouchers" in message
 
 
 def test_get_voucher_names_the_supplier_rather_than_repeating_its_id(book):

@@ -5,9 +5,27 @@ from datetime import date
 
 from .constants import TILA_KIRJANPIDOSSA
 from .dates import parse_iso_date
-from .errors import NoFiscalYearError
+from .errors import LedgerVoucherError, NoFiscalYearError
 from .money import cents_to_euros
 from .partners import ESCAPE_CLAUSE, contains_pattern
+
+# Sentinel for list_fiscal_years' "confirmed" field when Tilikausi.json could
+# not be read as an object: whether the year is confirmed is then genuinely
+# unknown, not "no". A missing or unreadable confirmation date must never
+# read as unconfirmed, because that is exactly the field that stops a write
+# into a closed year (see _check_fiscal_year in write.py); reporting None
+# here would silently reopen a fiscal year that might really be closed. The
+# sentinel is truthy, so a caller that only tests `if year["confirmed"]`
+# still refuses the write, and it is distinguishable from a real date so
+# _check_fiscal_year can raise a message that names the actual cause.
+FISCAL_YEAR_CONFIRMED_UNKNOWN = "unknown (unreadable fiscal year data)"
+
+
+def no_such_voucher_error(voucher_id: int) -> LedgerVoucherError:
+    return LedgerVoucherError(
+        f"There is no voucher {voucher_id} in this book. "
+        "Use list_vouchers to find the id of the voucher you meant."
+    )
 
 
 def list_fiscal_years(book) -> list[dict]:
@@ -16,12 +34,19 @@ def list_fiscal_years(book) -> list[dict]:
         rows = conn.execute("SELECT alkaa, loppuu, json FROM Tilikausi ORDER BY alkaa").fetchall()
     years = []
     for row in rows:
-        data = json.loads(row["json"] or "{}")
+        try:
+            data = json.loads(row["json"] or "{}")
+        except json.JSONDecodeError:
+            data = None
+        if isinstance(data, dict):
+            confirmed = data.get("vahvistettu")
+        else:
+            confirmed = FISCAL_YEAR_CONFIRMED_UNKNOWN
         years.append(
             {
                 "starts": row["alkaa"],
                 "ends": row["loppuu"],
-                "confirmed": data.get("vahvistettu"),
+                "confirmed": confirmed,
                 "current": row["alkaa"] <= today <= row["loppuu"],
             }
         )
@@ -118,7 +143,7 @@ def get_voucher(book, voucher_id: int):
             (voucher_id,),
         ).fetchone()
         if header is None:
-            return None
+            raise no_such_voucher_error(voucher_id)
         entries = conn.execute(
             "SELECT v.rivi, v.tyyppi, v.pvm, v.tili, v.selite, v.debetsnt, v.kreditsnt, "
             "       json_extract(ti.json, '$.nimi.fi') AS tilinimi "

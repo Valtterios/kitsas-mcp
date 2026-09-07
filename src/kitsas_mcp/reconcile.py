@@ -5,23 +5,23 @@ reconciled the ledger's bank account against the bank. Every automated bill
 asserts a payment; this is how a wrong one gets found.
 """
 
-from .accounts import default_bank_account, get_account
+from .accounts import account_on, default_bank_account_on
 from .constants import TILA_KIRJANPIDOSSA
 from .dates import parse_iso_date
 from .money import cents_to_euros
 
 
-def _resolve_account(book, account):
+def _resolve_account(conn, account):
     """An account passed explicitly is checked against Tili.
 
-    The default from default_bank_account is not checked again here: it
-    already resolved by querying Tili for the one ARP account, so a second
-    lookup would only repeat that work.
+    Takes the connection the caller already opened for the balance query
+    itself, so resolving the account (explicit or default) needs no
+    connection of its own.
     """
     if account is not None:
-        get_account(book, account)  # raises AccountNotFoundError for a bad number
+        account_on(conn, account)  # raises AccountNotFoundError for a bad number
         return account
-    return default_bank_account(book)
+    return default_bank_account_on(conn)
 
 
 def _balance_cents(conn, account: int, on_date: str) -> int:
@@ -36,8 +36,8 @@ def _balance_cents(conn, account: int, on_date: str) -> int:
 
 def bank_balance(book, on_date: str, account=None) -> dict:
     on_date = parse_iso_date(on_date, "on_date")
-    account = _resolve_account(book, account)
     with book.connect_read() as conn:
+        account = _resolve_account(conn, account)
         cents = _balance_cents(conn, account, on_date)
     return {"account": account, "date": on_date, "balance": cents_to_euros(cents)}
 
@@ -45,8 +45,8 @@ def bank_balance(book, on_date: str, account=None) -> dict:
 def bank_movements(book, date_from: str, date_to: str, account=None) -> list[dict]:
     date_from = parse_iso_date(date_from, "date_from")
     date_to = parse_iso_date(date_to, "date_to")
-    account = _resolve_account(book, account)
     with book.connect_read() as conn:
+        account = _resolve_account(conn, account)
         opening_date = _day_before(date_from)
         opening = _balance_cents(conn, account, opening_date) if opening_date is not None else 0
         rows = conn.execute(

@@ -1,7 +1,11 @@
 """Constants verified against the Kitsas source and against real books."""
 
 TILA_POISTETTU = 0
+TILA_MALLIPOHJA = 5
+TILA_HYLATTY = 10
 TILA_SAAPUNUT = 20
+TILA_TARKASTETTU = 30
+TILA_HYVAKSYTTY = 40
 TILA_LUONNOS = 50
 TILA_KIRJANPIDOSSA = 100
 
