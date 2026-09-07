@@ -24,6 +24,7 @@ from .constants import (
     VIENTI_OSTO_KIRJAUS,
     VIENTI_OSTO_VASTAKIRJAUS,
 )
+from .dates import parse_iso_date
 from .errors import (
     AmbiguousSupplierError,
     AmountError,
@@ -266,6 +267,16 @@ def add_purchase_invoice(
             "The supplier name is empty. Pass the supplier's name as it should appear "
             "on the voucher, for example 'Telia Finland Oyj'."
         )
+
+    # Optional, but not free-form: booking_date is already validated via
+    # _check_fiscal_year above. invoice_date and due_date are stored as-is
+    # into laskupvm/erapvm with no fiscal-year check of their own, so without
+    # this they would be the only two date fields on this voucher a malformed
+    # value could reach unchecked.
+    if invoice_date is not None:
+        invoice_date = parse_iso_date(invoice_date, "invoice_date")
+    if due_date is not None:
+        due_date = parse_iso_date(due_date, "due_date")
 
     prepared = _prepare_lines(book, lines, description, supplier_name)
     total = sum(cents for _, cents, _ in prepared)

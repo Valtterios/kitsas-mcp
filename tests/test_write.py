@@ -9,6 +9,7 @@ from kitsas_mcp.errors import (
     AmbiguousSupplierError,
     AmountError,
     ClosedFiscalYearError,
+    DateFormatError,
     KitsasError,
     LedgerVoucherError,
     LineFormatError,
@@ -184,6 +185,13 @@ def test_refuses_an_empty_supplier_name(book):
 def test_refuses_an_amount_that_is_not_money(book):
     with pytest.raises(AmountError):
         add_purchase_invoice(book, **{**BILL, "lines": [{"account": 4000, "amount": "about ten"}]})
+
+
+def test_refuses_a_malformed_invoice_date_and_writes_nothing(book, book_path):
+    before = book_path.read_bytes()
+    with pytest.raises(DateFormatError):
+        add_purchase_invoice(book, **{**BILL, "invoice_date": "2026-4-28"})
+    assert book_path.read_bytes() == before
 
 
 def test_a_failed_write_leaves_the_book_unchanged(book, book_path):

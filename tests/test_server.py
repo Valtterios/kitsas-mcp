@@ -1,6 +1,8 @@
+import asyncio
+
 import pytest
 
-from kitsas_mcp.server import TOOLS, call_tool, resolve_book_path
+from kitsas_mcp.server import TOOLS, build_server, call_tool, resolve_book_path
 
 
 def test_every_tool_has_a_description_and_a_handler():
@@ -74,3 +76,27 @@ def test_call_tool_returns_an_error_for_an_unexpected_argument_name(book_path):
     )
     assert "error" in result
     assert "add_purchase_invoice" in result["error"]
+
+
+def test_build_server_registers_all_ten_tools_with_a_schema(book_path):
+    # Smoke test for the part call_tool's own tests never touch: the actual
+    # mcp.server.Server wiring. The installed mcp package (2.x) registers
+    # request handlers through Server's on_list_tools/on_call_tool
+    # constructor keywords rather than through @server.list_tools()/
+    # @server.call_tool() decorators, so this exercises the tools/list
+    # handler through the same public Server.get_request_handler() lookup
+    # the runtime itself uses, rather than assuming a decorator API that
+    # this mcp version does not have.
+    server = build_server(book_path)
+
+    list_tools_entry = server.get_request_handler("tools/list")
+    assert list_tools_entry is not None, "no tools/list handler was registered"
+    result = asyncio.run(list_tools_entry.handler(None, None))
+
+    names = {tool.name for tool in result.tools}
+    assert names == set(TOOLS)
+    for tool in result.tools:
+        assert tool.description.strip(), f"{tool.name} has no description"
+        assert tool.input_schema["type"] == "object"
+
+    assert server.get_request_handler("tools/call") is not None, "no tools/call handler was registered"

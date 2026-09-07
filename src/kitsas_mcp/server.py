@@ -75,8 +75,8 @@ TOOLS = {
             "booking_date": {"type": "string", "description": "YYYY-MM-DD, must be in an open fiscal year"},
             "business_id": {"type": "string"},
             "iban": {"type": "string"},
-            "invoice_date": {"type": "string"},
-            "due_date": {"type": "string"},
+            "invoice_date": {"type": "string", "description": "YYYY-MM-DD"},
+            "due_date": {"type": "string", "description": "YYYY-MM-DD"},
             "reference": {"type": "string"},
             "description": {"type": "string"},
             "credit_account": {"type": "integer", "description": "Defaults to the bank account"},
@@ -91,7 +91,10 @@ TOOLS = {
     },
     "bank_balance": {
         "description": "The book's balance on the bank account as of a date, for checking against a bank statement.",
-        "schema": {"on_date": {"type": "string"}, "account": {"type": "integer"}},
+        "schema": {
+            "on_date": {"type": "string", "description": "YYYY-MM-DD"},
+            "account": {"type": "integer"},
+        },
         "handler": lambda book, args: reconcile.bank_balance(
             book, args["on_date"], args.get("account")
         ),
@@ -99,8 +102,8 @@ TOOLS = {
     "bank_movements": {
         "description": "Every ledger entry on the bank account in a date range, with a running balance, for reconciling against a statement.",
         "schema": {
-            "date_from": {"type": "string"},
-            "date_to": {"type": "string"},
+            "date_from": {"type": "string", "description": "YYYY-MM-DD"},
+            "date_to": {"type": "string", "description": "YYYY-MM-DD"},
             "account": {"type": "integer"},
         },
         "handler": lambda book, args: reconcile.bank_movements(
@@ -141,31 +144,41 @@ def call_tool(book_path, name, args):
 
 
 def build_server(book_path):
+    """Build the MCP server, wiring TOOLS onto the installed mcp package's request handlers.
+
+    The installed mcp package (2.x) registers request handlers through the
+    Server constructor's on_list_tools/on_call_tool keywords, taking
+    (ctx, params); it no longer offers the @server.list_tools()/@server.call_tool()
+    decorator methods some older mcp releases had. Using the decorator form
+    against this version fails immediately with AttributeError, before a
+    client ever connects, so it is exercised by a test rather than only
+    discovered by hand.
+    """
     from mcp.server import Server
-    from mcp.types import TextContent, Tool
+    from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool
 
-    server = Server("kitsas-mcp")
+    async def on_list_tools(ctx, params):
+        return ListToolsResult(
+            tools=[
+                Tool(
+                    name=name,
+                    description=spec["description"],
+                    inputSchema={
+                        "type": "object",
+                        "properties": spec["schema"],
+                    },
+                )
+                for name, spec in TOOLS.items()
+            ]
+        )
 
-    @server.list_tools()
-    async def list_tools():
-        return [
-            Tool(
-                name=name,
-                description=spec["description"],
-                inputSchema={
-                    "type": "object",
-                    "properties": spec["schema"],
-                },
-            )
-            for name, spec in TOOLS.items()
-        ]
+    async def on_call_tool(ctx, params):
+        result = call_tool(book_path, params.name, params.arguments or {})
+        return CallToolResult(
+            content=[TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+        )
 
-    @server.call_tool()
-    async def handle(name: str, arguments: dict):
-        result = call_tool(book_path, name, arguments or {})
-        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
-
-    return server
+    return Server("kitsas-mcp", on_list_tools=on_list_tools, on_call_tool=on_call_tool)
 
 
 def main():
