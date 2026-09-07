@@ -47,3 +47,7 @@ class LedgerVoucherError(KitsasError):
 
 class AmountError(KitsasError):
     pass
+
+
+class AmbiguousSupplierError(KitsasError):
+    pass

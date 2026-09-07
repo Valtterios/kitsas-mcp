@@ -1,11 +1,12 @@
 """What account has this supplier's spending been booked to before?"""
 
 from .constants import TILA_KIRJANPIDOSSA, TOSITE_MENO
+from .errors import AmbiguousSupplierError
 
 SQL = """
 SELECT v.tili AS tili,
        json_extract(ti.json, '$.nimi.fi') AS tilinimi,
-       count(*) AS lkm,
+       count(DISTINCT v.tosite) AS lkm,
        max(t.pvm) AS viimeksi
 FROM Vienti v
 JOIN Tosite t ON t.id = v.tosite
@@ -27,11 +28,19 @@ def _resolve_supplier_id(conn, supplier):
     ).fetchone()
     if row is not None:
         return row["id"]
-    row = conn.execute(
-        "SELECT id FROM Kumppani WHERE lower(nimi) LIKE lower(?) ORDER BY id LIMIT 1",
+    rows = conn.execute(
+        "SELECT id, nimi FROM Kumppani WHERE lower(nimi) LIKE lower(?) ORDER BY id",
         (f"%{supplier}%",),
-    ).fetchone()
-    return row["id"] if row else None
+    ).fetchall()
+    if len(rows) == 0:
+        return None
+    if len(rows) > 1:
+        names = ", ".join(r["nimi"] for r in rows)
+        raise AmbiguousSupplierError(
+            f"{supplier!r} matches {len(rows)} partners in this book ({names}). "
+            f"Pass the partner id instead; find_supplier lists them."
+        )
+    return rows[0]["id"]
 
 
 def suggest_account(book, supplier) -> list[dict]:
