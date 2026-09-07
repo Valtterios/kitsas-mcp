@@ -12,7 +12,7 @@ import sqlite3
 
 import pytest
 
-from kitsas_mcp.errors import AmbiguousSupplierError
+from kitsas_mcp.errors import AmbiguousSupplierError, SimilarPartnerError
 from kitsas_mcp.history import suggest_account
 from kitsas_mcp.partners import contains_pattern, escape_like, resolve_partner
 from kitsas_mcp.read import find_supplier
@@ -200,3 +200,158 @@ def test_a_finnish_name_still_reads_its_like_metacharacters_literally(book, book
     with book.connect_read() as conn:
         match = resolve_partner(conn, "ähtäri 50%", remedy="x")
     assert match.name == "Ähtäri 50% Oy", "the % must be a literal, not a wildcard"
+
+
+# -- a dropped umlaut is noticed, not resolved and not ignored ---------------
+# The trial that found this billed "Karkkainen" against a book holding
+# "Kärkkäinen Lahti". Case folding alone does not bring the two together, so
+# nothing matched, and a second partner appeared beside the first with no
+# warning of any kind. Accents are stripped only to NOTICE that: in Finnish ä
+# and a are different letters, so "Karkkainen" and "Kärkkäinen" can be two
+# different people and this server does not choose between them.
+
+KARKKAINEN = "Kärkkäinen Lahti"
+
+
+def test_the_accented_spelling_matches_exactly_and_books_onto_the_partner(book, book_path):
+    """The case that already worked, pinned: nothing here may refuse it."""
+    partner = add_partner(book_path, KARKKAINEN)
+
+    with book.connect_read() as conn:
+        match = resolve_partner(conn, KARKKAINEN, remedy="x")
+    assert (match.id, match.name, match.exact) == (partner, KARKKAINEN, True)
+
+    result = add_purchase_invoice(book, **{**BILL, "supplier_name": KARKKAINEN})
+    assert voucher_partner(book, result["voucher_id"]) == partner
+    assert partner_ids(book) == [1, 7, partner]
+
+
+def test_a_name_with_the_umlauts_dropped_is_refused_and_names_the_partner(book, book_path):
+    partner = add_partner(book_path, KARKKAINEN)
+
+    with pytest.raises(SimilarPartnerError) as excinfo:
+        add_purchase_invoice(book, **{**BILL, "supplier_name": "Karkkainen"})
+
+    message = str(excinfo.value)
+    assert KARKKAINEN in message and f"id {partner}" in message
+    assert "accents" in message
+    assert "partner_id" in message, "the way to book onto the existing partner"
+    assert "confirm_new_partner" in message, "the way to say they are different suppliers"
+
+    assert partner_ids(book) == [1, 7, partner], "no second partner may be created"
+    with book.connect_read() as conn:
+        assert conn.execute("SELECT count(*) FROM Tosite").fetchone()[0] == 4
+
+
+def test_the_same_refusal_reaches_suggest_account(book, book_path):
+    """The tool the model is told to call first must not answer 'no history'.
+
+    Returning [] there is what sends a treasurer on to bill a partner the book
+    already has, under a second spelling.
+    """
+    add_partner(book_path, KARKKAINEN)
+    with pytest.raises(SimilarPartnerError):
+        suggest_account(book, "Karkkainen")
+
+
+def test_find_supplier_shows_the_partner_whose_umlauts_were_dropped(book, book_path):
+    """The browsing tool decides nothing, so it may show both spellings."""
+    partner = add_partner(book_path, KARKKAINEN)
+    found = find_supplier(book, "Karkkainen")
+    assert [(p["id"], p["name"]) for p in found] == [(partner, KARKKAINEN)]
+
+
+def test_partner_id_books_the_bill_onto_the_partner_that_is_already_there(book, book_path):
+    """The first way out of the refusal: it is the same supplier after all."""
+    partner = add_partner(book_path, KARKKAINEN)
+
+    result = add_purchase_invoice(
+        book, **{**BILL, "supplier_name": "Karkkainen", "partner_id": partner}
+    )
+
+    assert voucher_partner(book, result["voucher_id"]) == partner
+    assert partner_ids(book) == [1, 7, partner]
+
+
+def test_confirm_new_partner_creates_the_separate_partner(book, book_path):
+    """The second way out: two spellings, two real suppliers.
+
+    'Karkkainen' without the dots is a name someone can actually be called,
+    so there has to be a way to say so and get the bill entered.
+    """
+    existing = add_partner(book_path, KARKKAINEN)
+
+    result = add_purchase_invoice(
+        book, **{**BILL, "supplier_name": "Karkkainen", "confirm_new_partner": True}
+    )
+
+    created = [i for i in partner_ids(book) if i not in (1, 7, existing)]
+    assert len(created) == 1, "exactly one new partner, beside the one already there"
+    assert result["supplier"] == "Karkkainen"
+    assert voucher_partner(book, result["voucher_id"]) == created[0]
+
+
+def test_confirming_does_not_fork_a_partner_the_name_really_matches(book, book_path):
+    """The flag answers a resemblance, not the matching rule itself."""
+    partner = add_partner(book_path, KARKKAINEN)
+
+    result = add_purchase_invoice(
+        book, **{**BILL, "supplier_name": KARKKAINEN, "confirm_new_partner": True}
+    )
+
+    assert result["supplier_id"] == partner
+    assert partner_ids(book) == [1, 7, partner]
+
+
+def test_two_finnish_names_that_merely_look_similar_are_not_a_near_match(book, book_path):
+    """Järvi and Jarvinen are two names, not one name spelt two ways.
+
+    Nothing about the resemblance rule may make an ordinary new supplier
+    harder to enter: only names that are the same once the accents come off
+    are reported.
+    """
+    existing = add_partner(book_path, "Matti Järvi")
+
+    result = add_purchase_invoice(book, **{**BILL, "supplier_name": "Matti Jarvinen"})
+
+    created = [i for i in partner_ids(book) if i not in (1, 7, existing)]
+    assert len(created) == 1
+    assert result["supplier"] == "Matti Jarvinen"
+    assert "accents" not in result["summary"]
+
+
+def test_an_unrelated_new_supplier_is_still_created_without_a_word(book):
+    result = add_purchase_invoice(book, **{**BILL, "supplier_name": "Telia Finland Oyj"})
+    assert result["supplier"] == "Telia Finland Oyj"
+    assert "accents" not in result["summary"]
+
+
+def test_the_accented_spelling_wins_when_both_spellings_are_in_the_book(book, book_path):
+    """An exact match is an answer; the resemblance is only looked for after one fails."""
+    accented = add_partner(book_path, "Kärkkäinen")
+    add_partner(book_path, "Karkkainen")
+
+    with book.connect_read() as conn:
+        match = resolve_partner(conn, "Kärkkäinen", remedy="x")
+    assert (match.id, match.exact) == (accented, True)
+
+
+def test_several_partners_can_share_the_resemblance_and_all_are_named(book, book_path):
+    """Two partners already spelt differently from each other, both named."""
+    first = add_partner(book_path, "Ähtärin Sähkö")
+    second = add_partner(book_path, "Ähtärin Sahkö")
+
+    with book.connect_read() as conn:
+        with pytest.raises(SimilarPartnerError) as excinfo:
+            resolve_partner(conn, "Ahtarin Sahko", remedy="x")
+
+    message = str(excinfo.value)
+    assert f"id {first}" in message and f"id {second}" in message
+
+
+def test_a_resemblance_is_not_reported_when_the_name_matches_a_partner(book, book_path):
+    """'Hetzner' is a partner, and 'Hetzner' with a stray accent is not consulted."""
+    add_partner(book_path, "Hetzner Ähtäri")
+    with book.connect_read() as conn:
+        match = resolve_partner(conn, "Hetzner", remedy="x")
+    assert match.id == 7 and match.exact is True

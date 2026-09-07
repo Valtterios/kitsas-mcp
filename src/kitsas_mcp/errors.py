@@ -61,6 +61,15 @@ class AmbiguousSupplierError(KitsasError):
     pass
 
 
+class SimilarPartnerError(KitsasError):
+    """A name matching no partner, beside one that differs from it only in accents.
+
+    Its own error rather than an AmbiguousSupplierError: nothing matched the
+    name here, so the caller is not choosing between matches but deciding
+    whether a dropped umlaut was a typo or a different supplier.
+    """
+
+
 class PartnerNotFoundError(KitsasError):
     """An explicit partner_id that names no partner, or is not an id at all."""
 

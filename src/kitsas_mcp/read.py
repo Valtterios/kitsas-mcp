@@ -7,7 +7,7 @@ from .constants import TILA_KIRJANPIDOSSA
 from .dates import parse_iso_date
 from .errors import LedgerVoucherError, NoFiscalYearError
 from .money import cents_to_euros
-from .partners import ESCAPE_CLAUSE, contains_pattern, folded
+from .partners import ESCAPE_CLAUSE, contains_pattern, folded, unaccented
 
 # Every fiscal year carries "confirmed_unknown" beside "confirmed": true when
 # Tilikausi.json could not be read as an object, so whether the year is
@@ -65,17 +65,25 @@ def fiscal_year_for(book, when: str) -> dict:
 # quote character inside an f-string expression only became legal in Python
 # 3.12, and this package supports 3.11.
 _NAME = folded("k.nimi")
+_UNACCENTED_NAME = unaccented("k.nimi")
 _BUSINESS_ID = folded("coalesce(k.alvtunnus,'')")
 _IBAN = folded("coalesce(i.iban,'')")
 _TYPED = folded()
+_UNACCENTED_TYPED = unaccented()
 FIND_SUPPLIER_SQL = (
     "SELECT k.id, k.nimi, k.alvtunnus FROM Kumppani k "
     "LEFT JOIN KumppaniIban i ON i.kumppani = k.id "
     f"WHERE {_NAME} LIKE {_TYPED} {ESCAPE_CLAUSE} "
+    f"OR {_UNACCENTED_NAME} LIKE {_UNACCENTED_TYPED} {ESCAPE_CLAUSE} "
     f"OR {_BUSINESS_ID} = {_TYPED} "
     f"OR replace({_IBAN},' ','') = replace({_TYPED},' ','') "
     "GROUP BY k.id ORDER BY k.nimi"
 )
+
+# Every IBAN of each partner found, read separately rather than off the join
+# above: that join is filtered by the WHERE clause, so a search for one of a
+# partner's IBANs would otherwise report that partner as having only that one.
+PARTNER_IBANS_SQL = "SELECT kumppani, iban FROM KumppaniIban WHERE kumppani IN ({}) ORDER BY iban"
 
 
 def find_supplier(book, query: str) -> list[dict]:
@@ -91,11 +99,41 @@ def find_supplier(book, query: str) -> list[dict]:
     tool a bookkeeper reaches for to check the other two disagreed with
     them. Both sides are case-folded by casefold(), not by SQLite's
     ASCII-only lower(); see partners.py.
+
+    A name is also matched with its accents ignored, which the resolver does
+    not do: searching 'Karkkainen' has to show the 'Kärkkäinen Lahti' that is
+    already in the book, since the whole point of looking a supplier up before
+    billing it is to find out whether it is there. This is the tool where
+    showing more is right, because it decides nothing; both spellings are in
+    the list, and which of them the bill belongs to stays the reader's call.
+
+    Each partner's IBANs come back with it. Without them there was no way to
+    see, before add_purchase_invoice refused the bill, that an IBAN read off
+    an invoice already belongs to a different partner, even though this tool
+    matches on IBANs.
     """
     query = str(query).strip()
     with book.connect_read() as conn:
-        rows = conn.execute(FIND_SUPPLIER_SQL, (contains_pattern(query), query, query)).fetchall()
-    return [{"id": r["id"], "name": r["nimi"], "vat_id": r["alvtunnus"]} for r in rows]
+        rows = conn.execute(
+            FIND_SUPPLIER_SQL,
+            (contains_pattern(query), contains_pattern(query), query, query),
+        ).fetchall()
+        ibans = {}
+        if rows:
+            placeholders = ",".join("?" * len(rows))
+            for iban_row in conn.execute(
+                PARTNER_IBANS_SQL.format(placeholders), [r["id"] for r in rows]
+            ):
+                ibans.setdefault(iban_row["kumppani"], []).append(iban_row["iban"])
+    return [
+        {
+            "id": r["id"],
+            "name": r["nimi"],
+            "vat_id": r["alvtunnus"],
+            "ibans": ibans.get(r["id"], []),
+        }
+        for r in rows
+    ]
 
 
 def list_vouchers(book, date_from, date_to, supplier=None, account=None, state=None) -> list[dict]:
