@@ -1,0 +1,30 @@
+# Never commit accounting books or their backups
+*.kitsas
+*.sqlite
+*.sqlite3
+*.db
+*.bak
+*.wal
+*.shm
+*-wal
+*-shm
+
+# Never commit invoices or receipts
+*.pdf
+!docs/**/*.pdf
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local test fixtures containing real data
+tests/fixtures/books/
